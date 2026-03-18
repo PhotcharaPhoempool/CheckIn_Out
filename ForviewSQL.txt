@@ -1,0 +1,18 @@
+#main postgres
+sudo -u postgres psql
+
+
+
+#data base face_attendance
+sudo -u postgres psql -d face_attendance
+
+SELECT 
+    a.id,
+    e.employee_code,
+    e.full_name,
+    a.check_time,
+    a.status,
+    a.camera_name
+FROM attendance_logs a
+JOIN employees e ON a.employee_id = e.id
+ORDER BY a.check_time DESC;

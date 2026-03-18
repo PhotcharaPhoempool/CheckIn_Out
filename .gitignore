@@ -1,0 +1,57 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env/
+.venv/
+
+# Environment variables / secrets
+.env
+.env.*
+*.env
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# VS Code / JetBrains
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Database / local files
+*.sqlite3
+
+# Face recognition generated files
+encodings.pkl
+attendance.csv
+
+# Uploaded / temporary image files
+*.tmp
+*.temp
+*.jpg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy / type check
+.mypy_cache/
+
+# Local config
+config.local.py
