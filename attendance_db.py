@@ -37,27 +37,35 @@ def has_checked_in_today(employee_id):
             """, (employee_id,))
             return cur.fetchone() is not None
 
-def mark_attendance(employee_id, status, camera_name=None):
+def mark_attendance(employee_id, status, camera_name=None, check_time=None):
     try:
         if already_marked_today(employee_id, status):
-            print(f"วันนี้บันทึก {status} แล้ว")
+            print(f"[DB] วันนี้บันทึก {status} (employee_id={employee_id}) แล้ว — ข้ามได้")
             return False
 
         if status == "OUT" and not has_checked_in_today(employee_id):
-            print("ยังไม่มีข้อมูลเข้างานวันนี้ จึงเช็กเอาต์ไม่ได้")
+            print(f"[DB] employee_id={employee_id} ยังไม่มีข้อมูล IN วันนี้ ไม่สามารถบันทึก OUT")
             return False
 
         with get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO attendance_logs (employee_id, status, camera_name)
-                    VALUES (%s, %s, %s)
-                """, (employee_id, status, camera_name))
+                if check_time is not None:
+                    cur.execute("""
+                        INSERT INTO attendance_logs (employee_id, status, camera_name, check_time)
+                        VALUES (%s, %s, %s, %s)
+                    """, (employee_id, status, camera_name, check_time))
+                else:
+                    cur.execute("""
+                        INSERT INTO attendance_logs (employee_id, status, camera_name)
+                        VALUES (%s, %s, %s)
+                    """, (employee_id, status, camera_name))
             conn.commit()
 
-        print(f"บันทึกเวลา {status} สำเร็จ")
+        print(f"[DB] บันทึก {status} สำเร็จ (employee_id={employee_id})")
         return True
 
     except Exception as e:
-        print("เกิดข้อผิดพลาด:", e)
+        print(f"[DB ERROR] mark_attendance({employee_id}, {status}): {e}")
+        import traceback
+        traceback.print_exc()
         return False

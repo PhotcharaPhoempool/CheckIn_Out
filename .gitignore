@@ -55,3 +55,6 @@ htmlcov/
 
 # Local config
 config.local.py
+
+# Other
+.claude/

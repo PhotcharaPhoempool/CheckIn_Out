@@ -16,3 +16,6 @@ SELECT
 FROM attendance_logs a
 JOIN employees e ON a.employee_id = e.id
 ORDER BY a.check_time DESC;
+
+#Reset data
+TRUNCATE TABLE attendance_logs RESTART IDENTITY;
