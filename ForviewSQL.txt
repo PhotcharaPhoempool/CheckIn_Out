@@ -6,6 +6,7 @@ sudo -u postgres psql
 #data base face_attendance
 sudo -u postgres psql -d face_attendance
 
+#ViewData
 SELECT 
     a.id,
     e.employee_code,
