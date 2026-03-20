@@ -20,3 +20,22 @@ ORDER BY a.check_time DESC;
 
 #Reset data
 TRUNCATE TABLE attendance_logs RESTART IDENTITY;
+
+# --- docker version ---
+# Enter to windows postgres sql
+docker exec -it checkinout-postgres psql -U face_user -d face_attendance
+
+#ViewData
+SELECT 
+    a.id,
+    e.employee_code,
+    e.full_name,
+    a.check_time,
+    a.status,
+    a.camera_name
+FROM attendance_logs a
+JOIN employees e ON a.employee_id = e.id
+ORDER BY a.check_time DESC;
+
+#Reset data
+docker exec -it checkinout-postgres psql -U face_user -d face_attendance -c "TRUNCATE TABLE attendance_logs RESTART IDENTITY;"
