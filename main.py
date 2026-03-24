@@ -79,6 +79,7 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
     fps_counter     = 0
     fps_timer       = start_ts
     display_fps     = 0.0
+    last_face_ts    = start_ts    # เวลาล่าสุดที่เห็นหน้า
 
     # ═════════════════════════════════════════
     # MAIN LOOP
@@ -87,6 +88,8 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
         ret, frame = cam.read()
         if not ret or frame is None:
             continue
+        if cfg.CAMERA_FLIP:
+            frame = cv2.flip(frame, 1)
 
         now    = datetime.now()
         now_ts = now.timestamp()
@@ -122,6 +125,7 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
             lms   = face_recognition.face_landmarks(rgb, locs)
             last_results = list(zip(encs, locs, lms))
 
+
         # ─── Hand detection (เฉพาะเมื่อมี active challenge) ───
         hand_results = None
         has_challenge = any(
@@ -132,12 +136,38 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
         if has_challenge and do_detect:
             hand_results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        # ─── ประมวลผลแต่ละหน้า ───
+        # ─── Reset liveness state ที่ timeout ครบแล้ว ───
+        session.cleanup_expired(now_ts)
+
+        # ─── ไม่เจอหน้า N วินาที → reset liveness (เก็บ snapshot ไว้) ───
+        if last_results:
+            last_face_ts = now_ts
+        elif now_ts - last_face_ts >= cfg.NO_FACE_RESET_SEC:
+            # เคลียร์ liveness ของคนที่ยังไม่ checked_in
+            for name in list(session.liveness.keys()):
+                person = session.persons.get(name)
+                if not person or not person.checked_in:
+                    del session.liveness[name]
+            last_results = []
+            last_face_ts = now_ts  # reset timer
+
+        # ─── เก็บ frame ดิบ (สำหรับ snapshot ไม่ติด overlay) ───
+        orig_frame = frame.copy()
+
+        # ─── คำนวณ face boxes + ชื่อ (สำหรับ guide) ───
+        _face_with_names = []   # [(face_box, name), ...]
+
+        # ─── คำนวณ oval guide (ค่าเดียวกับ ui_renderer.draw_face_guide) ───
+        _fh, _fw = frame.shape[:2]
+        _oval_cx = _fw // 2
+        _oval_cy = int(_fh * 0.47)
+        _oval_ew = int(_fh * 0.29)
+        _oval_eh = int(_fh * 0.34)
+
+        # ─── ประมวลผลแต่ละหน้า (update liveness ก่อน แล้วค่อย draw guide) ───
         for enc, loc, lm in last_results:
-            # จดจำหน้า
             name = _identify_face(enc, known_encodings, known_names)
 
-            # แปลง coordinates กลับเป็น full-size
             t, r, b, l = loc
             top    = int(t / cfg.FRAME_SCALE)
             right  = int(r / cfg.FRAME_SCALE)
@@ -146,34 +176,49 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
             face_w = right - left
             face_box = (top, right, bottom, left)
 
-            # ตัดรูปหน้า
-            fh, fw = frame.shape[:2]
-            pad = 15
-            crop = frame[max(0, top-pad):min(fh, bottom+pad),
-                         max(0, left-pad):min(fw, right+pad)]
+            # ── ตรวจว่าหน้าอยู่ในวงรีไหม (tolerance 1.4) ──
+            fcx = (left + right) / 2.0
+            fcy = (top  + bottom) / 2.0
+            in_oval = (((fcx - _oval_cx) / _oval_ew) ** 2 +
+                       ((fcy - _oval_cy) / _oval_eh) ** 2) <= 1.4
 
-            # Unknown → วาดกรอบแดงแล้วข้าม
+            if not in_oval:
+                # เห็นนอกวงรี → วาดกรอบแดงบางๆ แต่ไม่ประมวลผล liveness
+                ui.draw_face_box(frame, left, top, right, bottom,
+                                 cfg.Color.UNKNOWN, "Move into oval")
+                continue
+
+            _face_with_names.append((face_box, name))
+
+            fh, fw = orig_frame.shape[:2]
+            pad  = 15
+            crop = orig_frame[max(0, top-pad):min(fh, bottom+pad),
+                              max(0, left-pad):min(fw, right+pad)]
+
             if name == "Unknown":
                 ui.draw_face_box(frame, left, top, right, bottom, cfg.Color.UNKNOWN, "Unknown")
                 continue
 
-            # ─── จัดการ session + liveness ───
             person, liveness = session.get_or_create(name, now, crop)
 
-            # อัปเดต liveness (5 ด่าน)
             session.engine.update(
                 liveness, lm, crop, face_box, face_w,
                 frame, hand_results, now_ts, do_detect,
             )
 
-            # ลอง check-in
+            # อัปเดต snapshot ด้วยรูป full frame ตอน liveness ผ่าน (ก่อน check-in)
+            if liveness.confirmed and not person.checked_in:
+                person.snapshot = orig_frame.copy()
+
             session.try_checkin(name, camera_name)
 
-            # ─── วาด UI ───
+            if cfg.SHOW_LANDMARKS:
+                ui.draw_landmarks(frame, lm, cfg.FRAME_SCALE)
             color, label = ui.get_face_visual(name, person, liveness)
             ui.draw_face_box(frame, left, top, right, bottom, color, label)
-            ui.draw_landmarks(frame, lm, cfg.FRAME_SCALE)
-            ui.draw_challenge_overlay(frame, liveness, now_ts)
+
+        # ─── Face guide overlay ───
+        ui.draw_face_guide(frame, _face_with_names, session.liveness, session.persons, now_ts)
 
         # ─── วาด hands + HUD + panel ───
         ui.draw_hands(frame, hand_results)
@@ -210,4 +255,4 @@ def _identify_face(encoding, known_encodings, known_names) -> str:
 
 
 if __name__ == "__main__":
-    run_camera(camera_index=0, camera_name="CAM_MAIN")
+    run_camera(camera_index=1, camera_name="CAM_MAIN")

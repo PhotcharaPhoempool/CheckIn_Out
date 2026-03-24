@@ -1,18 +1,12 @@
 """
-liveness_engine.py — ระบบตรวจสอบความจริงของใบหน้า (5 ด่าน)
+liveness_engine.py — ระบบตรวจสอบความจริงของใบหน้า (6 ด่าน)
 =============================================================
 ด่าน 1: DepthAnalyzer     — ตรวจ 3D geometry จาก landmark
 ด่าน 2: MotionAnalyzer    — ตรวจ micro-movement ข้ามเฟรม
 ด่าน 3: TextureAnalyzer   — ตรวจ texture ผิวหนัง vs จอ
 ด่าน 4: ScreenDetector    — ตรวจขอบจอ/กรอบมือถือ
 ด่าน 5: FingerChallenge   — สุ่มชูนิ้ว 1-5
-
-ใช้งาน:
-    engine = LivenessEngine()
-    state  = engine.create_state()
-    engine.update(state, landmarks, face_crop, face_box, frame, hand_results, now_ts)
-    if state.is_confirmed():  ...
-    if state.is_failed():     ...
+ด่าน 6: FASDetector       — MiniFASNet deep learning (DeepFace)
 """
 
 import math
@@ -62,6 +56,12 @@ class LivenessState:
     challenge_hold: int = 0
     challenge_detected: int = -1       # นิ้วที่ detect ได้ล่าสุด
 
+    # ด่าน 6: MiniFASNet (DeepFace)
+    fas_ok: bool = not cfg.FAS_ENABLED
+    fas_score: float = -1.0            # score ล่าสุด (-1 = ยังไม่ตรวจ)
+    fas_real_count: int = 0            # จำนวนครั้งที่ผ่าน
+    fas_check_count: int = 0           # จำนวนครั้งที่ตรวจ
+
     def is_confirmed(self) -> bool:
         return self.confirmed
 
@@ -69,8 +69,9 @@ class LivenessState:
         return self.failed
 
     def all_passive_passed(self) -> bool:
-        """ด่าน 1-4 ผ่านหมดแล้วหรือยัง"""
-        return self.depth_ok and self.motion_ok and self.texture_ok and self.screen_ok
+        """ด่าน 1-4 + ด่าน 6 ผ่านหมดแล้วหรือยัง"""
+        return (self.depth_ok and self.motion_ok and self.texture_ok
+                and self.screen_ok and self.fas_ok)
 
     def all_passed(self) -> bool:
         """ทุกด่านผ่าน"""
@@ -246,10 +247,12 @@ class TextureAnalyzer:
 class ScreenDetector:
     """ตรวจขอบจอ/กรอบมือถือรอบใบหน้า ด้วย Canny + HoughLines"""
 
-    def detect(self, gray_frame: np.ndarray, face_box: tuple, margin: int = 40) -> tuple:
+    def detect(self, gray_frame: np.ndarray, face_box: tuple, margin: int = 60) -> tuple:
         """
         Returns: (is_screen: bool, ratio: float)
         face_box = (top, right, bottom, left)
+        ต้องมีทั้งเส้นแนวนอนและแนวตั้งพร้อมกันจึงถือว่าเป็นจอ
+        (หน้าคนจริงในห้องมักมีเส้นเพียงทิศทางเดียว เช่น ขอบประตู/หน้าต่าง)
         """
         top, right, bottom, left = face_box
         fh, fw = gray_frame.shape[:2]
@@ -273,17 +276,123 @@ class ScreenDetector:
             return False, 0.0
 
         perimeter = 2 * (roi.shape[0] + roi.shape[1])
-        total = 0
+        h_total = 0.0   # เส้นแนวนอน
+        v_total = 0.0   # เส้นแนวตั้ง
         for line in lines:
             x1l, y1l, x2l, y2l = line[0]
             length = math.hypot(x2l - x1l, y2l - y1l)
-            angle = abs(math.atan2(y2l - y1l, x2l - x1l))
-            # นับเฉพาะแนวตั้ง/แนวนอน
-            if angle < 0.2 or abs(angle - math.pi/2) < 0.2 or abs(angle - math.pi) < 0.2:
-                total += length
+            angle  = abs(math.atan2(y2l - y1l, x2l - x1l))
+            if angle < 0.18 or abs(angle - math.pi) < 0.18:
+                h_total += length
+            elif abs(angle - math.pi / 2) < 0.18:
+                v_total += length
 
-        ratio = total / perimeter if perimeter > 0 else 0
+        # ใช้ค่าต่ำสุดของทั้งสองทิศทาง → ต้องมีทั้งคู่จึงนับ
+        min_edge = min(h_total, v_total)
+        ratio = min_edge / perimeter if perimeter > 0 else 0
         return ratio > cfg.SCREEN_EDGE_MAX, ratio
+
+
+# ─────────────────────────────────────────────
+# ด่าน 6: MiniFASNet via DeepFace
+# ─────────────────────────────────────────────
+class FASDetector:
+    """
+    ตรวจ face anti-spoofing ด้วย MiniFASNet (ผ่าน DeepFace)
+    
+    Model ขนาด ~1.5 MB, รันบน CPU ได้
+    ให้ score 0.0-1.0 (> 0.5 = REAL, < 0.5 = SPOOF)
+    
+    ใช้งาน:
+        fas = FASDetector()
+        result = fas.check(face_crop_bgr)
+        # result = {"is_real": True, "score": 0.85} หรือ None
+    """
+
+    def __init__(self):
+        self._deepface = None
+        self._loaded = False
+        self._available = True
+
+    @property
+    def is_available(self) -> bool:
+        """FAS พร้อมใช้งานไหม (lazy load ครั้งแรก)"""
+        if not self._loaded:
+            self._ensure_loaded()
+        return self._available
+
+    def _ensure_loaded(self):
+        """Lazy load DeepFace (ครั้งแรกจะ download model อัตโนมัติ)"""
+        if self._loaded:
+            return self._available
+        self._loaded = True
+
+        try:
+            from deepface import DeepFace
+            self._deepface = DeepFace
+
+            # Warm up — ให้ download model ก่อน
+            dummy = np.zeros((80, 80, 3), dtype=np.uint8)
+            dummy[20:60, 20:60] = 128
+            self._deepface.extract_faces(
+                dummy, anti_spoofing=True,
+                enforce_detection=False,
+                detector_backend="skip",
+            )
+            print("[FAS] MiniFASNet โหลดสำเร็จ")
+            return True
+
+        except ImportError:
+            print("[FAS] WARNING: ไม่พบ deepface — pip install deepface tf-keras")
+            print("[FAS] ด่าน 6 จะถูกข้ามไป")
+            self._available = False
+            return False
+
+        except Exception as e:
+            print(f"[FAS] WARNING: โหลด model ไม่สำเร็จ: {e}")
+            self._available = False
+            return False
+
+    def check(self, face_crop_bgr: np.ndarray) -> dict:
+        """
+        ตรวจ face crop ว่าเป็นของจริงหรือไม่
+        
+        Args:
+            face_crop_bgr: ภาพหน้าที่ตัดมาแล้ว (BGR, ขนาดใดก็ได้)
+        
+        Returns:
+            {"is_real": bool, "score": float} หรือ None ถ้าตรวจไม่ได้
+        """
+        if not self._ensure_loaded():
+            return None
+
+        if face_crop_bgr is None or face_crop_bgr.size == 0:
+            return None
+        if face_crop_bgr.shape[0] < 30 or face_crop_bgr.shape[1] < 30:
+            return None
+
+        try:
+            # แปลง BGR → RGB (DeepFace ใช้ RGB)
+            rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+
+            results = self._deepface.extract_faces(
+                img_path=rgb,
+                anti_spoofing=True,
+                enforce_detection=False,
+                detector_backend=cfg.FAS_DETECTOR_BACKEND,
+            )
+
+            if not results:
+                return None
+
+            face = results[0]
+            score = face.get("antispoof_score", 0.0)
+            is_real = face.get("is_real", score > cfg.FAS_THRESHOLD)
+
+            return {"is_real": is_real, "score": score}
+
+        except Exception:
+            return None
 
 
 # ─────────────────────────────────────────────
@@ -374,6 +483,7 @@ class LivenessEngine:
         self.texture  = TextureAnalyzer()
         self.screen   = ScreenDetector()
         self.finger   = FingerChallenge()
+        self.fas      = FASDetector()
 
     def create_state(self, now_ts: float) -> LivenessState:
         return LivenessState(start_ts=now_ts)
@@ -390,10 +500,11 @@ class LivenessEngine:
         if now_ts - s.start_ts > cfg.LIVENESS_TIMEOUT:
             s.failed = True
             reasons = []
-            if not s.depth_ok:   reasons.append("Depth")
-            if not s.motion_ok:  reasons.append("Motion")
-            if not s.texture_ok: reasons.append("Texture")
-            if not s.screen_ok:  reasons.append("Screen")
+            if not s.depth_ok:     reasons.append("Depth")
+            if not s.motion_ok:    reasons.append("Motion")
+            if not s.texture_ok:   reasons.append("Texture")
+            if not s.screen_ok:    reasons.append("Screen")
+            if not s.fas_ok:       reasons.append("FAS")
             if not s.challenge_ok: reasons.append("Finger")
             s.fail_reason = "FAIL:" + "+".join(reasons) if reasons else "Timeout"
             print(f"[TIMEOUT] {s.fail_reason}")
@@ -437,6 +548,28 @@ class LivenessEngine:
                 s.fail_reason = f"Screen({ratio:.2f})"
                 print(f"[SCREEN DETECTED] ratio={ratio:.2f}")
                 return
+
+        # ─── ด่าน 6: MiniFASNet (DeepFace) ───
+        if cfg.FAS_ENABLED and not s.fas_ok and not s.failed and do_detect:
+            # ถ้า DeepFace ไม่พร้อม → ข้ามด่านนี้ ไม่ block ระบบ
+            if not self.fas.is_available:
+                s.fas_ok = True
+            else:
+                s.fas_check_count += 1
+                if s.fas_check_count % cfg.FAS_CHECK_EVERY == 0:
+                    result = self.fas.check(face_crop)
+                    if result:
+                        s.fas_score = result["score"]
+                        if result["is_real"]:
+                            s.fas_real_count += 1
+                            if s.fas_real_count >= cfg.FAS_REQUIRED_REAL:
+                                s.fas_ok = True
+                                print(f"[FAS OK] score={result['score']:.3f} ({s.fas_real_count} real)")
+                        else:
+                            s.failed = True
+                            s.fail_reason = f"FAS:Spoof({result['score']:.2f})"
+                            print(f"[FAS SPOOF] score={result['score']:.3f}")
+                            return
 
         # ─── ด่าน 5: Finger Challenge ───
         if cfg.CHALLENGE_ENABLED and not s.challenge_ok and s.all_passive_passed() and not s.failed:

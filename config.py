@@ -10,7 +10,7 @@ from datetime import time as dtime
 ENCODINGS_FILE        = "encodings.pkl"
 FACE_TOLERANCE        = 0.45      # ค่าความเข้มในการเทียบหน้า (ต่ำ=เข้มงวด)
 FRAME_SCALE           = 0.25      # ย่อภาพกี่เท่าก่อนตรวจจับ (เล็ก=เร็ว)
-PANEL_WIDTH           = 300       # ความกว้าง panel ขวา (px)
+PANEL_WIDTH           = 200      # ความกว้าง panel ขวา (px)
 
 # ─── โหมดทดสอบ ─────────────────────────────
 TEST_MODE             = False
@@ -20,9 +20,10 @@ CHECKOUT_TIME         = dtime(22, 0)  # เวลา OUT จริง (22:00 = 4
 # ─── Performance ───────────────────────────
 DETECT_EVERY_N_FRAMES = 2         # ตรวจจับทุกกี่เฟรม (1=ทุกเฟรม, 2=ข้าม 1)
 FULLSCREEN            = True      # เปิดเต็มจอ
+CAMERA_FLIP           = True      # กลับด้านกล้อง (mirror)
 
 # ─── Anti-Spoofing: ด่าน 1 — Landmark Depth ───
-LIVENESS_TIMEOUT      = 10        # timeout รวม (วินาที)
+LIVENESS_TIMEOUT      = 20        # timeout รวม (ต้อง > passive ~4s + challenge 6s)
 LIVENESS_RETRY_AFTER  = 4         # รอกี่วินาทีก่อน retry
 DEPTH_FRAMES_REQUIRED = 5         # ต้องผ่านกี่เฟรม
 DEPTH_FRAMES_WINDOW   = 8         # ดูจากกี่เฟรมล่าสุด
@@ -41,7 +42,7 @@ TEXTURE_CHROMA_MIN    = 6.0       # Chroma std ขั้นต่ำ
 
 # ─── Anti-Spoofing: ด่าน 4 — Screen Border ────
 SCREEN_DETECT_ENABLED = True
-SCREEN_EDGE_MAX       = 0.35      # สัดส่วนเส้นตรงรอบหน้า (เกิน=จอ)
+SCREEN_EDGE_MAX       = 0.18      # min(H,V) lines ratio (ต้องมีทั้งแนวนอนและแนวตั้ง)
 
 # ─── Anti-Spoofing: ด่าน 5 — Finger Challenge ─
 CHALLENGE_ENABLED     = True
@@ -51,6 +52,20 @@ CHALLENGE_HOLD_FRAMES = 4         # ค้างท่าถูกกี่เ�
 CHALLENGE_NEAR_FACE   = True      # มือต้องอยู่ใกล้หน้า
 CHALLENGE_PROXIMITY   = 1.5       # ระยะมือ (เท่าของความกว้างหน้า)
 
+# ─── Anti-Spoofing: ด่าน 6 — MiniFASNet (DeepFace) ─
+FAS_ENABLED           = True
+FAS_THRESHOLD         = 0.5       # score > นี้ = REAL, < นี้ = SPOOF
+FAS_CHECK_EVERY       = 5         # ตรวจทุกกี่ detection-frame (ช้ากว่าด่านอื่น)
+FAS_REQUIRED_REAL     = 2         # ต้องผ่านกี่ครั้งถึงจะ OK
+FAS_DETECTOR_BACKEND  = "skip"    # "skip" = ไม่ detect หน้าใหม่ (ใช้ crop ที่มี)
+
+
+# ─── UI Options ────────────────────────────
+SHOW_LANDMARKS        = True     # แสดงจุด landmark (nose/chin) บน frame
+NO_FACE_RESET_SEC     = 5        # ไม่เจอหน้ากี่วินาที → reset liveness
+
+# ─── Face Guide Overlay ────────────────────
+GUIDE_OVERLAY         = True      # แสดงวงรีไกด์ช่วยวางตำแหน่งหน้า
 
 # ─── สี (BGR) ──────────────────────────────
 def _hex(h):
@@ -74,7 +89,7 @@ class Color:
     PANEL_HEADER  = _hex("#323232")
     DIVIDER       = _hex("#3A3A3A")
     TEXT          = _hex("#FFFFFF")
-    TEXT_DIM      = _hex("#BEBEBE")
+    TEXT_DIM      = _hex("#FF0000") #fps&LTS
     TEXT_CYAN     = _hex("#00E6E6")
     TEXT_MORE     = _hex("#969696")
     HUD_TEST      = _hex("#00E6E6")

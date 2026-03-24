@@ -77,6 +77,22 @@ class SessionManager:
 
         return self.persons[name], self.liveness[name]
 
+    # ─── Periodic retry (เรียกทุกเฟรม) ──────
+    def cleanup_expired(self, now_ts: float):
+        """
+        Reset liveness state ที่ fail และครบเวลา retry
+        เรียกทุกเฟรมใน main loop เพื่อให้ reset ทันที
+        ไม่ต้องรอให้ face detection จับหน้าเจอก่อน
+        """
+        for name in list(self.liveness.keys()):
+            lv     = self.liveness[name]
+            person = self.persons.get(name)
+            if (lv.failed
+                    and (person is None or not person.checked_in)
+                    and now_ts - lv.start_ts > cfg.LIVENESS_TIMEOUT + cfg.LIVENESS_RETRY_AFTER):
+                print(f"[RETRY] {name} — reset liveness")
+                self.liveness[name] = self.engine.create_state(now_ts)
+
     # ─── Check-in ────────────────────────────
 
     def try_checkin(self, name: str, camera_name: str) -> bool:
