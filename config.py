@@ -6,75 +6,140 @@ config.py — ตั้งค่าทั้งหมดของระบบ
 from datetime import time as dtime
 
 
-# ─── ระบบหลัก ──────────────────────────────
+# ╔═══════════════════════════════════════════╗
+# ║  ระบบหลัก + ArcFace                        ║
+# ╚═══════════════════════════════════════════╝
 ENCODINGS_FILE        = "encodings.pkl"
-FACE_TOLERANCE        = 0.45      # ค่าความเข้มในการเทียบหน้า (ต่ำ=เข้มงวด)
-FRAME_SCALE           = 0.25      # ย่อภาพกี่เท่าก่อนตรวจจับ (เล็ก=เร็ว)
-PANEL_WIDTH           = 200      # ความกว้าง panel ขวา (px)
+FACE_TOLERANCE        = 0.35      # cosine similarity ขั้นต่ำ (ArcFace ใช้ 0.3-0.4)
+DET_SIZE              = (640, 640)  # ขนาดภาพสำหรับ detection (insightface)
+PANEL_WIDTH           = 200
 
-# ─── โหมดทดสอบ ─────────────────────────────
+# ╔═══════════════════════════════════════════╗
+# ║  โหมดทดสอบ                                 ║
+# ╚═══════════════════════════════════════════╝
 TEST_MODE             = False
-TEST_DURATION_SECONDS = 60        # OUT หลังกี่วินาที (เฉพาะ TEST_MODE)
-CHECKOUT_TIME         = dtime(22, 0)  # เวลา OUT จริง (22:00 = 4 ทุ่ม)
+TEST_DURATION_SECONDS = 60
+CHECKOUT_TIME         = dtime(22, 0)
 
-# ─── Performance ───────────────────────────
-DETECT_EVERY_N_FRAMES = 2         # ตรวจจับทุกกี่เฟรม (1=ทุกเฟรม, 2=ข้าม 1)
-FULLSCREEN            = True      # เปิดเต็มจอ
-CAMERA_FLIP           = True      # กลับด้านกล้อง (mirror)
+# ╔═══════════════════════════════════════════╗
+# ║  Performance                              ║
+# ╚═══════════════════════════════════════════╝
+DETECT_EVERY_N_FRAMES = 2
+FULLSCREEN            = True
+CAMERA_FLIP           = True
 
-# ─── Anti-Spoofing: ด่าน 1 — Landmark Depth ───
-LIVENESS_TIMEOUT      = 20        # timeout รวม (ต้อง > passive ~4s + challenge 6s)
-LIVENESS_RETRY_AFTER  = 4         # รอกี่วินาทีก่อน retry
-DEPTH_FRAMES_REQUIRED = 5         # ต้องผ่านกี่เฟรม
-DEPTH_FRAMES_WINDOW   = 8         # ดูจากกี่เฟรมล่าสุด
-DEPTH_NOSE_MIN        = 0.18      # จมูกยื่นขั้นต่ำ
-DEPTH_JAW_MIN         = 0.015     # ความโค้งกรามขั้นต่ำ
-DEPTH_SYMMETRY_MIN    = 0.002     # ความไม่สมมาตรขั้นต่ำ
+# ╔═══════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 1 — Landmark Depth   ║
+# ╚═══════════════════════════════════════════╝
+LIVENESS_TIMEOUT      = 20
+LIVENESS_RETRY_AFTER  = 4
+DEPTH_FRAMES_REQUIRED = 5
+DEPTH_FRAMES_WINDOW   = 8
+DEPTH_NOSE_MIN        = 0.18
+DEPTH_JAW_MIN         = 0.015
+DEPTH_SYMMETRY_MIN    = 0.002
 
-# ─── Anti-Spoofing: ด่าน 2 — Micro-Motion ─────
-MOTION_VAR_MIN        = 0.3       # landmark drift ขั้นต่ำ
+# ╔═══════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 2 — Micro-Motion     ║
+# ╚═══════════════════════════════════════════╝
+MOTION_VAR_MIN        = 1.2       # ปรับเพราะ ArcFace ใช้ full-res landmarks (เดิม 0.3 ที่ 0.25x)
 
-# ─── Anti-Spoofing: ด่าน 3 — Texture ──────────
+# ╔═══════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 3 — Texture          ║
+# ╚═══════════════════════════════════════════╝
 TEXTURE_ENABLED       = True
-TEXTURE_LBP_MIN       = 3.5       # LBP variance ขั้นต่ำ
-TEXTURE_LAP_MIN       = 15.0      # Laplacian variance ขั้นต่ำ
-TEXTURE_CHROMA_MIN    = 6.0       # Chroma std ขั้นต่ำ
+TEXTURE_LBP_MIN       = 3.5
+TEXTURE_LAP_MIN       = 15.0
+TEXTURE_CHROMA_MIN    = 6.0
 
-# ─── Anti-Spoofing: ด่าน 4 — Screen Border ────
+# ╔═══════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 4 — Screen Border    ║
+# ╚═══════════════════════════════════════════╝
 SCREEN_DETECT_ENABLED = True
-SCREEN_EDGE_MAX       = 0.18      # min(H,V) lines ratio (ต้องมีทั้งแนวนอนและแนวตั้ง)
+SCREEN_EDGE_MAX       = 0.18
 
-# ─── Anti-Spoofing: ด่าน 5 — Finger Challenge ─
+# ╔═══════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 5 — Finger Challenge ║
+# ╚═══════════════════════════════════════════╝
 CHALLENGE_ENABLED     = True
-CHALLENGE_COUNT       = 1         # ต้องชูนิ้วถูกกี่ครั้ง
-CHALLENGE_TIMEOUT     = 6.0       # วินาทีต่อครั้ง
-CHALLENGE_HOLD_FRAMES = 4         # ค้างท่าถูกกี่เฟรมถึงนับผ่าน
-CHALLENGE_NEAR_FACE   = True      # มือต้องอยู่ใกล้หน้า
-CHALLENGE_PROXIMITY   = 1.5       # ระยะมือ (เท่าของความกว้างหน้า)
+CHALLENGE_COUNT       = 1
+CHALLENGE_TIMEOUT     = 6.0
+CHALLENGE_HOLD_FRAMES = 4
+CHALLENGE_NEAR_FACE   = True
+CHALLENGE_PROXIMITY   = 1.5
 
-# ─── Anti-Spoofing: ด่าน 6 — MiniFASNet (DeepFace) ─
+# ╔═══════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 6 — MiniFASNet       ║
+# ╚═══════════════════════════════════════════╝
 FAS_ENABLED           = True
-FAS_THRESHOLD         = 0.5       # score > นี้ = REAL, < นี้ = SPOOF
-FAS_CHECK_EVERY       = 5         # ตรวจทุกกี่ detection-frame (ช้ากว่าด่านอื่น)
-FAS_REQUIRED_REAL     = 2         # ต้องผ่านกี่ครั้งถึงจะ OK
-FAS_DETECTOR_BACKEND  = "skip"    # "skip" = ไม่ detect หน้าใหม่ (ใช้ crop ที่มี)
+FAS_THRESHOLD         = 0.5
+FAS_CHECK_EVERY       = 5
+FAS_REQUIRED_REAL     = 2
+FAS_DETECTOR_BACKEND  = "skip"
 
+# ╔═══════════════════════════════════════════╗
+# ║  UI: General                              ║
+# ╚═══════════════════════════════════════════╝
+SHOW_LANDMARKS        = True
+NO_FACE_RESET_SEC     = 5
 
-# ─── UI Options ────────────────────────────
-SHOW_LANDMARKS        = True     # แสดงจุด landmark (nose/chin) บน frame
-NO_FACE_RESET_SEC     = 5        # ไม่เจอหน้ากี่วินาที → reset liveness
+# ╔═══════════════════════════════════════════╗
+# ║  UI: Face Guide Overlay (วงรี)             ║
+# ╚═══════════════════════════════════════════╝
+GUIDE_OVERLAY         = True
+GUIDE_OVAL_CY         = 0.47     # ตำแหน่งแนวตั้ง (สัดส่วนของ frame height)
+GUIDE_OVAL_EW         = 0.29     # ความกว้างวงรี (สัดส่วนของ frame height)
+GUIDE_OVAL_EH         = 0.34     # ความสูงวงรี
+GUIDE_DIM_FACTOR      = 0.38     # ความมืดนอกวงรี (0=ดำ, 1=ไม่มืด)
+GUIDE_DIM_BLUR        = 41       # blur ขอบวงรี (เลขคี่)
+GUIDE_IN_OVAL_TOL     = 1.4      # tolerance (1.0=ตรง, 1.5=หลวม)
+GUIDE_OVAL_THICK      = 3
+GUIDE_OVAL_INNER      = 1
 
-# ─── Face Guide Overlay ────────────────────
-GUIDE_OVERLAY         = True      # แสดงวงรีไกด์ช่วยวางตำแหน่งหน้า
+# ╔═══════════════════════════════════════════╗
+# ║  UI: Instruction Card (การ์ดด้านล่าง)       ║
+# ╚═══════════════════════════════════════════╝
+CARD_HEIGHT           = 82
+CARD_HEIGHT_SMALL     = 58
+CARD_WIDTH_MAX        = 420
+CARD_MARGIN_BOTTOM    = 14
+CARD_PADDING_LEFT     = 18
+CARD_BG               = (245, 245, 245)
+CARD_ACCENT_W         = 6
+CARD_SHADOW_OFF       = 3
+CARD_SHADOW_ALPHA     = 0.35
+CARD_FONT_MAIN        = 0.72
+CARD_FONT_SUB         = 0.50
+CARD_TEXT_MAIN        = (25, 25, 25)
+CARD_TEXT_SUB         = (80, 80, 80)
+CARD_MAIN_Y           = 14
+CARD_SUB_Y            = 50
 
-# ─── สี (BGR) ──────────────────────────────
+# ╔═══════════════════════════════════════════╗
+# ║  UI: Face Box (กรอบหน้า)                   ║
+# ╚═══════════════════════════════════════════╝
+FACEBOX_THICK         = 2
+FACEBOX_LABEL_H       = 28
+FACEBOX_FONT          = 0.45
+FACEBOX_PAD           = 5
+
+# ╔═══════════════════════════════════════════╗
+# ║  UI: Side Panel (แผงขวา)                   ║
+# ╚═══════════════════════════════════════════╝
+PANEL_HEADER_H        = 38
+PANEL_FACE_SIZE       = 80
+PANEL_ITEM_EXTRA      = 58
+PANEL_START_Y         = 46
+PANEL_FACE_X          = 8
+
+# ╔═══════════════════════════════════════════╗
+# ║  สี (BGR)                                 ║
+# ╚═══════════════════════════════════════════╝
 def _hex(h):
-    """แปลง hex เป็น BGR tuple"""
     h = h.lstrip("#")
     return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
 
 class Color:
-    """สีทั้งหมด เรียกใช้: Color.CHECKED_IN"""
     UNKNOWN       = _hex("#FF3333")
     LIVENESS      = _hex("#FFD700")
     LIVENESS_FAIL = _hex("#FF6600")
@@ -84,14 +149,14 @@ class Color:
     CHALLENGE     = _hex("#FF00FF")
     OK            = _hex("#00FF99")
     FAIL          = _hex("#FF4444")
-    # Panel / HUD
     PANEL_BG      = _hex("#1C1C1C")
     PANEL_HEADER  = _hex("#323232")
     DIVIDER       = _hex("#3A3A3A")
     TEXT          = _hex("#FFFFFF")
-    TEXT_DIM      = _hex("#FF0000") #fps&LTS
+    TEXT_DIM      = _hex("#FF0000")
     TEXT_CYAN     = _hex("#00E6E6")
     TEXT_MORE     = _hex("#969696")
     HUD_TEST      = _hex("#00E6E6")
     HUD_DONE      = _hex("#FF8C00")
     FACE_PH       = _hex("#3C3C3C")
+    OVAL_DEFAULT  = (210, 210, 210)

@@ -1,29 +1,21 @@
 """
-face_camera_runner.py — Main loop
-===================================
-ไฟล์นี้เป็นตัวประสานงาน:
-  1. อ่านเฟรมจากกล้อง          (camera.py)
-  2. ตรวจจับ+จดจำใบหน้า         (face_recognition)
-  3. ตรวจสอบ liveness 5 ด่าน     (liveness_engine.py)
-  4. จัดการ check-in / check-out  (session_manager.py)
-  5. วาด UI                     (ui_renderer.py)
+main.py — Main loop (InsightFace / ArcFace)
+=============================================
+เปลี่ยนจาก face_recognition (dlib 128d) → InsightFace (ArcFace 512d)
 
-โครงสร้างไฟล์:
-  config.py          — ตั้งค่าทั้งหมด (แก้ที่นี่ที่เดียว)
-  camera.py          — ThreadedCamera
-  liveness_engine.py — Anti-spoofing 5 ด่าน
-  session_manager.py — Person tracking + check-in/out
-  ui_renderer.py     — วาด UI ทั้งหมด
-  attendance_db.py   — เชื่อมต่อฐานข้อมูล (ไม่ได้แก้)
+ติดตั้ง:
+  pip install insightface onnxruntime-gpu   # (หรือ onnxruntime สำหรับ CPU)
+
+ครั้งแรกที่รัน จะ download model buffalo_l อัตโนมัติ (~300MB)
 """
 
 import os
 import cv2
 import pickle
 import numpy as np
-import face_recognition
 import mediapipe as mp
 from datetime import datetime
+from numpy.linalg import norm
 
 import config as cfg
 from camera import ThreadedCamera
@@ -31,22 +23,81 @@ from session_manager import SessionManager
 import ui_renderer as ui
 
 
-def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
-    """Main loop — เปิดกล้อง, ตรวจหน้า, ตรวจ liveness, บันทึกเวลา"""
+# ─── InsightFace landmark → dict (สำหรับ DepthAnalyzer) ──────
+def landmarks_68_to_dict(pts) -> dict:
+    """
+    แปลง 68-point landmarks (array shape 68x2 หรือ 68x3)
+    เป็น dict แบบที่ DepthAnalyzer ใช้ (เหมือน face_recognition)
 
-    # ─── โหลด face encodings ───
+    dlib 68-point mapping:
+      0-16   chin (17 points)
+      17-21  left_eyebrow (5)
+      22-26  right_eyebrow (5)
+      27-30  nose_bridge (4)
+      31-35  nose_tip (5)
+      36-41  left_eye (6)
+      42-47  right_eye (6)
+    """
+    p = [(float(pts[i][0]), float(pts[i][1])) for i in range(68)]
+    return {
+        "chin":           p[0:17],
+        "left_eyebrow":   p[17:22],
+        "right_eyebrow":  p[22:27],
+        "nose_bridge":    p[27:31],
+        "nose_tip":       p[31:36],
+        "left_eye":       p[36:42],
+        "right_eye":      p[42:48],
+    }
+
+
+# ─── Face Matching (cosine similarity) ──────
+def identify_face(embedding, known_encodings, known_names) -> str:
+    """เทียบ 512d embedding กับฐานข้อมูล ด้วย cosine similarity"""
+    if len(known_encodings) == 0:
+        return "Unknown"
+
+    # คำนวณ cosine similarity กับทุกคนในฐานข้อมูล
+    sims = []
+    emb_norm = embedding / (norm(embedding) + 1e-10)
+    for known_emb in known_encodings:
+        known_norm = known_emb / (norm(known_emb) + 1e-10)
+        sims.append(np.dot(emb_norm, known_norm))
+
+    best_idx = np.argmax(sims)
+    if sims[best_idx] >= cfg.FACE_TOLERANCE:
+        return known_names[best_idx]
+    return "Unknown"
+
+
+def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
+    """Main loop"""
+
+    # ─── โหลด face encodings (ArcFace 512d) ───
     if not os.path.exists(cfg.ENCODINGS_FILE):
-        raise FileNotFoundError(f"ไม่พบ {cfg.ENCODINGS_FILE} — รัน encode_faces.py ก่อน")
-
+        raise FileNotFoundError(
+            f"ไม่พบ {cfg.ENCODINGS_FILE}\n"
+            f"รัน encode_faces_arcface.py ก่อน"
+        )
     with open(cfg.ENCODINGS_FILE, "rb") as f:
         data = pickle.load(f)
     known_encodings = data["encodings"]
     known_names     = data["names"]
+    print(f"[DB] โหลด {len(known_names)} คน จาก {cfg.ENCODINGS_FILE}")
+
+    # ─── InsightFace ───
+    from insightface.app import FaceAnalysis
+
+    app = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    app.prepare(ctx_id=0, det_size=cfg.DET_SIZE)
+    print(f"[ARCFACE] InsightFace ready  det_size={cfg.DET_SIZE}")
 
     # ─── เปิดกล้อง ───
     cam = ThreadedCamera(camera_index)
 
-    # ─── MediaPipe Hands (สำหรับ finger challenge) ───
+    # ─── MediaPipe Hands ───
     hands = mp.solutions.hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
@@ -58,12 +109,14 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
     session = SessionManager()
 
     # ─── แสดงข้อมูลเริ่มต้น ───
-    print("=== ระบบตรวจใบหน้า (Multi-Layer Anti-Spoof) ===")
-    print(f"[CAM]       {cam.width}x{cam.height}  detect_every={cfg.DETECT_EVERY_N_FRAMES}")
-    print(f"[DEPTH]     {cfg.DEPTH_FRAMES_REQUIRED}/{cfg.DEPTH_FRAMES_WINDOW} เฟรม")
+    print("=== ระบบตรวจใบหน้า (ArcFace + Multi-Layer Anti-Spoof) ===")
+    print(f"[CAM]       {cam.width}x{cam.height}")
+    print(f"[DEPTH]     {cfg.DEPTH_FRAMES_REQUIRED}/{cfg.DEPTH_FRAMES_WINDOW}")
     print(f"[TEXTURE]   {'ON' if cfg.TEXTURE_ENABLED else 'OFF'}")
     print(f"[SCREEN]    {'ON' if cfg.SCREEN_DETECT_ENABLED else 'OFF'}")
-    print(f"[CHALLENGE] x{cfg.CHALLENGE_COUNT}  timeout={cfg.CHALLENGE_TIMEOUT}s" if cfg.CHALLENGE_ENABLED else "[CHALLENGE] OFF")
+    if cfg.CHALLENGE_ENABLED:
+        print(f"[CHALLENGE] x{cfg.CHALLENGE_COUNT}  timeout={cfg.CHALLENGE_TIMEOUT}s")
+    print(f"[FAS]       {'ON' if cfg.FAS_ENABLED else 'OFF'}")
 
     # ─── หน้าต่าง ───
     win_name = "Face Attendance System"
@@ -72,18 +125,26 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
         cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     # ─── ตัวแปร loop ───
-    start_ts        = datetime.now().timestamp()
-    checkout_done   = False
-    frame_count     = 0
-    last_results    = []          # cache ผลลัพธ์ face detection
-    fps_counter     = 0
-    fps_timer       = start_ts
-    display_fps     = 0.0
-    last_face_ts    = start_ts    # เวลาล่าสุดที่เห็นหน้า
+    start_ts     = datetime.now().timestamp()
+    checkout_done = False
+    frame_count  = 0
+    last_faces   = []     # cache ผลลัพธ์ insightface
+    fps_counter  = 0
+    fps_timer    = start_ts
+    display_fps  = 0.0
+    last_face_ts = start_ts
 
-    # ═════════════════════════════════════════
+    # ─── คำนวณ oval ───
+    def _compute_oval(h, w):
+        cx = w // 2
+        cy = int(h * cfg.GUIDE_OVAL_CY)
+        ew = int(h * cfg.GUIDE_OVAL_EW)
+        eh = int(h * cfg.GUIDE_OVAL_EH)
+        return cx, cy, ew, eh
+
+    # ═══════════════════════════════════════
     # MAIN LOOP
-    # ═════════════════════════════════════════
+    # ═══════════════════════════════════════
     while True:
         ret, frame = cam.read()
         if not ret or frame is None:
@@ -101,32 +162,23 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
             display_fps = fps_counter / (now_ts - fps_timer)
             fps_counter, fps_timer = 0, now_ts
 
-        # ─── Checkout trigger ───
-        if cfg.TEST_MODE:
-            should_checkout = (now_ts - start_ts) >= cfg.TEST_DURATION_SECONDS
-        else:
-            should_checkout = now.time() >= cfg.CHECKOUT_TIME
-
+        # ─── Checkout ───
+        should_checkout = (
+            (now_ts - start_ts >= cfg.TEST_DURATION_SECONDS) if cfg.TEST_MODE
+            else (now.time() >= cfg.CHECKOUT_TIME)
+        )
         if should_checkout and not checkout_done:
             checkout_done = True
             session.do_checkout(camera_name, now)
-
         if cfg.TEST_MODE and checkout_done:
             break
 
-        # ─── Face detection (ทุก N เฟรม) ───
+        # ─── Face detection (InsightFace) ───
         do_detect = (frame_count % cfg.DETECT_EVERY_N_FRAMES == 0)
-
         if do_detect:
-            small = cv2.resize(frame, (0, 0), fx=cfg.FRAME_SCALE, fy=cfg.FRAME_SCALE)
-            rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            locs  = face_recognition.face_locations(rgb)
-            encs  = face_recognition.face_encodings(rgb, locs)
-            lms   = face_recognition.face_landmarks(rgb, locs)
-            last_results = list(zip(encs, locs, lms))
+            last_faces = app.get(frame)
 
-
-        # ─── Hand detection (เฉพาะเมื่อมี active challenge) ───
+        # ─── Hand detection ───
         hand_results = None
         has_challenge = any(
             lv.challenge_phase == "active"
@@ -136,91 +188,105 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
         if has_challenge and do_detect:
             hand_results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        # ─── Reset liveness state ที่ timeout ครบแล้ว ───
+        # ─── Reset expired ───
         session.cleanup_expired(now_ts)
 
-        # ─── ไม่เจอหน้า N วินาที → reset liveness (เก็บ snapshot ไว้) ───
-        if last_results:
+        # ─── No-face reset ───
+        if last_faces:
             last_face_ts = now_ts
         elif now_ts - last_face_ts >= cfg.NO_FACE_RESET_SEC:
-            # เคลียร์ liveness ของคนที่ยังไม่ checked_in
             for name in list(session.liveness.keys()):
                 person = session.persons.get(name)
                 if not person or not person.checked_in:
                     del session.liveness[name]
-            last_results = []
-            last_face_ts = now_ts  # reset timer
+            last_faces = []
+            last_face_ts = now_ts
 
-        # ─── เก็บ frame ดิบ (สำหรับ snapshot ไม่ติด overlay) ───
         orig_frame = frame.copy()
 
-        # ─── คำนวณ face boxes + ชื่อ (สำหรับ guide) ───
-        _face_with_names = []   # [(face_box, name), ...]
+        # ─── Oval params ───
+        fh, fw = frame.shape[:2]
+        oval_cx, oval_cy, oval_ew, oval_eh = _compute_oval(fh, fw)
 
-        # ─── คำนวณ oval guide (ค่าเดียวกับ ui_renderer.draw_face_guide) ───
-        _fh, _fw = frame.shape[:2]
-        _oval_cx = _fw // 2
-        _oval_cy = int(_fh * 0.47)
-        _oval_ew = int(_fh * 0.29)
-        _oval_eh = int(_fh * 0.34)
+        # ─── Process faces ───
+        _face_with_names = []
 
-        # ─── ประมวลผลแต่ละหน้า (update liveness ก่อน แล้วค่อย draw guide) ───
-        for enc, loc, lm in last_results:
-            name = _identify_face(enc, known_encodings, known_names)
-
-            t, r, b, l = loc
-            top    = int(t / cfg.FRAME_SCALE)
-            right  = int(r / cfg.FRAME_SCALE)
-            bottom = int(b / cfg.FRAME_SCALE)
-            left   = int(l / cfg.FRAME_SCALE)
+        for face in last_faces:
+            # ── bbox ──
+            x1, y1, x2, y2 = face.bbox.astype(int)
+            left, top, right, bottom = x1, y1, x2, y2
             face_w = right - left
             face_box = (top, right, bottom, left)
 
-            # ── ตรวจว่าหน้าอยู่ในวงรีไหม (tolerance 1.4) ──
+            # ── ตรวจว่าอยู่ในวงรี ──
             fcx = (left + right) / 2.0
-            fcy = (top  + bottom) / 2.0
-            in_oval = (((fcx - _oval_cx) / _oval_ew) ** 2 +
-                       ((fcy - _oval_cy) / _oval_eh) ** 2) <= 1.4
+            fcy = (top + bottom) / 2.0
+            in_oval = (
+                ((fcx - oval_cx) / oval_ew) ** 2 +
+                ((fcy - oval_cy) / oval_eh) ** 2
+            ) <= cfg.GUIDE_IN_OVAL_TOL
 
             if not in_oval:
-                # เห็นนอกวงรี → วาดกรอบแดงบางๆ แต่ไม่ประมวลผล liveness
                 ui.draw_face_box(frame, left, top, right, bottom,
                                  cfg.Color.UNKNOWN, "Move into oval")
                 continue
 
+            # ── Identify (ArcFace 512d) ──
+            embedding = face.embedding
+            name = identify_face(embedding, known_encodings, known_names)
+
             _face_with_names.append((face_box, name))
 
-            fh, fw = orig_frame.shape[:2]
-            pad  = 15
+            # ── Face crop ──
+            pad = 15
             crop = orig_frame[max(0, top-pad):min(fh, bottom+pad),
                               max(0, left-pad):min(fw, right+pad)]
 
             if name == "Unknown":
-                ui.draw_face_box(frame, left, top, right, bottom, cfg.Color.UNKNOWN, "Unknown")
+                ui.draw_face_box(frame, left, top, right, bottom,
+                                 cfg.Color.UNKNOWN, "Unknown")
                 continue
 
+            # ── Landmarks (68-point → dict) ──
+            lm_dict = None
+            if face.landmark_3d_68 is not None:
+                lm_dict = landmarks_68_to_dict(face.landmark_3d_68)
+            elif face.landmark_2d_106 is not None:
+                # fallback: ใช้ 5-point จาก kps (ไม่ครบ แต่ดีกว่าไม่มี)
+                lm_dict = None  # DepthAnalyzer จะข้ามถ้าไม่มี
+
+            # ── Liveness ──
             person, liveness = session.get_or_create(name, now, crop)
 
-            session.engine.update(
-                liveness, lm, crop, face_box, face_w,
-                frame, hand_results, now_ts, do_detect,
-            )
+            if lm_dict:
+                session.engine.update(
+                    liveness, lm_dict, crop, face_box, face_w,
+                    frame, hand_results, now_ts, do_detect,
+                )
+            else:
+                # ไม่มี 68-point landmarks → ข้าม depth/motion แต่ยัง check texture/screen/FAS
+                session.engine.update(
+                    liveness, {}, crop, face_box, face_w,
+                    frame, hand_results, now_ts, do_detect,
+                )
 
-            # อัปเดต snapshot ด้วยรูป full frame ตอน liveness ผ่าน (ก่อน check-in)
             if liveness.confirmed and not person.checked_in:
                 person.snapshot = orig_frame.copy()
 
             session.try_checkin(name, camera_name)
 
-            if cfg.SHOW_LANDMARKS:
-                ui.draw_landmarks(frame, lm, cfg.FRAME_SCALE)
+            # ── Draw ──
+            if cfg.SHOW_LANDMARKS and lm_dict:
+                ui.draw_landmarks(frame, lm_dict, scale=1.0)
+
             color, label = ui.get_face_visual(name, person, liveness)
             ui.draw_face_box(frame, left, top, right, bottom, color, label)
 
-        # ─── Face guide overlay ───
-        ui.draw_face_guide(frame, _face_with_names, session.liveness, session.persons, now_ts)
+        # ─── Guide overlay ───
+        ui.draw_face_guide(frame, _face_with_names,
+                           session.liveness, session.persons, now_ts)
 
-        # ─── วาด hands + HUD + panel ───
+        # ─── Hands + HUD + Panel ───
         ui.draw_hands(frame, hand_results)
 
         remaining = max(0, cfg.TEST_DURATION_SECONDS - int(now_ts - start_ts)) if cfg.TEST_MODE else 0
@@ -229,29 +295,13 @@ def run_camera(camera_index: int = 2, camera_name: str = "CAM_MAIN"):
         panel = ui.build_panel(session.persons, session.liveness, frame.shape[0])
         cv2.imshow(win_name, np.hstack([frame, panel]))
 
-        # ─── ออกด้วย q หรือ ESC ───
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q") or key == 27:
             break
 
-    # ─── Cleanup ───
     hands.close()
     cam.release()
     cv2.destroyAllWindows()
-
-
-def _identify_face(encoding, known_encodings, known_names) -> str:
-    """เทียบหน้ากับ encoding ที่รู้จัก — return ชื่อหรือ 'Unknown'"""
-    if len(known_encodings) == 0:
-        return "Unknown"
-
-    matches   = face_recognition.compare_faces(known_encodings, encoding, tolerance=cfg.FACE_TOLERANCE)
-    distances = face_recognition.face_distance(known_encodings, encoding)
-
-    best = distances.argmin()
-    if matches[best]:
-        return known_names[best]
-    return "Unknown"
 
 
 if __name__ == "__main__":
