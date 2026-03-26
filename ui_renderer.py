@@ -90,9 +90,17 @@ def draw_text(img, text, pos, scale=0.45, color=C.TEXT, thickness=1):
 def draw_face_box(frame, left, top, right, bottom, color, label):
     cv2.rectangle(frame, (left, top), (right, bottom), color, cfg.FACEBOX_THICK)
     lh = cfg.FACEBOX_LABEL_H
-    cv2.rectangle(frame, (left, bottom - lh), (right, bottom), color, cv2.FILLED)
-    cv2.putText(frame, label, (left + cfg.FACEBOX_PAD, bottom - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, cfg.FACEBOX_FONT, C.TEXT, 1)
+    fh, fw = frame.shape[:2]
+    y1 = max(0, bottom - lh)
+    y2 = min(fh, bottom)
+    x1 = max(0, left)
+    x2 = min(fw, right)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, cv2.FILLED)
+    # render text บน label ROI เท่านั้น (ไม่แปลง full frame เป็น PIL)
+    if x2 > x1 and y2 > y1:
+        roi = frame[y1:y2, x1:x2]
+        draw_text(roi, label, (cfg.FACEBOX_PAD, 5), scale=cfg.FACEBOX_FONT, color=C.TEXT)
+        frame[y1:y2, x1:x2] = roi
 
 
 def draw_landmarks(frame, lm_dict, scale=1.0):
@@ -114,22 +122,21 @@ def draw_hands(frame, hand_results):
 # ─── Face color + label ─────────────────────
 
 def get_face_visual(name, person, liveness):
+    display = (getattr(person, "display_name", None) or name)[:24]
     if liveness.failed:
-        return C.LIVENESS_FAIL, f"{name} [{liveness.fail_reason}]"
+        return C.LIVENESS_FAIL, f"{display} [{liveness.fail_reason}]"
     if liveness.challenge_phase == "active" and not liveness.confirmed:
         cn = liveness.challenge_number
         dn = len(liveness.challenge_done)
-        det = liveness.challenge_detected
-        det_str = f" see:{det}" if det >= 0 else ""
-        return C.CHALLENGE, f"{name} [Show {cn} ({dn+1}/{cfg.CHALLENGE_COUNT}){det_str}]"
+        return C.CHALLENGE, f"{display} [Show {cn} ({dn+1}/{cfg.CHALLENGE_COUNT})]"
     if not liveness.confirmed:
         dp = liveness.depth_pass_count
-        return C.LIVENESS, f"{name} [Scan {dp}/{cfg.DEPTH_FRAMES_REQUIRED}]"
+        return C.LIVENESS, f"{display} [Scan {dp}/{cfg.DEPTH_FRAMES_REQUIRED}]"
     if person.checked_out:
-        return C.CHECKED_OUT, name
+        return C.CHECKED_OUT, display
     if person.checked_in:
-        return C.CHECKED_IN, name
-    return C.NOT_IN_DB, name
+        return C.CHECKED_IN, display
+    return C.NOT_IN_DB, display
 
 
 # ─── Challenge overlay ──────────────────────
@@ -155,6 +162,30 @@ def draw_challenge_overlay(frame, liveness, now_ts):
 
 # ─── Face Guide Oval (ใช้ cfg.GUIDE_*) ──────
 
+_oval_alpha_cache: dict = {}   # cache alpha mask เพื่อหลีกเลี่ยง GaussianBlur ทุก frame
+
+def _get_oval_blend(h, w, cx, cy, ew, eh):
+    """
+    คืน blend_u8_3ch uint8 (h,w,3) — คำนวณครั้งเดียวต่อ frame size
+    ใช้: frame[:] = ((frame.astype(uint16) * blend_u8_3ch) >> 8).astype(uint8)
+    เร็วกว่า float32 blend ~10x
+    """
+    key = (h, w, cx, cy, ew, eh, cfg.GUIDE_DIM_FACTOR)
+    if key not in _oval_alpha_cache:
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(mask, (cx, cy), (ew, eh), 0, 0, 360, 255, -1)
+        blur = cv2.GaussianBlur(mask.astype(np.float32),
+                                (cfg.GUIDE_DIM_BLUR, cfg.GUIDE_DIM_BLUR), 0) / 255.0
+        dim = cfg.GUIDE_DIM_FACTOR
+        blend_f = (blur * (1.0 - dim) + dim)
+        # uint8 3-channel ให้ทำ integer multiply ได้เลย (เร็วกว่า float ~10x)
+        blend_u8 = np.repeat((blend_f * 255).astype(np.uint8)[..., np.newaxis], 3, axis=2)
+        _oval_alpha_cache[key] = blend_u8
+        if len(_oval_alpha_cache) > 4:
+            _oval_alpha_cache.pop(next(iter(_oval_alpha_cache)))
+    return _oval_alpha_cache[key]
+
+
 def draw_face_guide(frame, face_boxes_full: list, liveness_map: dict,
                     persons: dict = None, now_ts: float = 0.0):
     if not cfg.GUIDE_OVERLAY:
@@ -166,14 +197,9 @@ def draw_face_guide(frame, face_boxes_full: list, liveness_map: dict,
     ew = int(h * cfg.GUIDE_OVAL_EW)
     eh = int(h * cfg.GUIDE_OVAL_EH)
 
-    # Dim พื้นที่นอกวงรี
-    dark = (frame.astype(np.float32) * cfg.GUIDE_DIM_FACTOR).astype(np.uint8)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.ellipse(mask, (cx, cy), (ew, eh), 0, 0, 360, 255, -1)
-    blur = cv2.GaussianBlur(mask.astype(np.float32),
-                             (cfg.GUIDE_DIM_BLUR, cfg.GUIDE_DIM_BLUR), 0) / 255.0
-    alpha = blur[..., np.newaxis]
-    frame[:] = (frame * alpha + dark * (1.0 - alpha)).astype(np.uint8)
+    # Dim พื้นที่นอกวงรี — uint16 integer multiply (เร็ว ~10x vs float32)
+    blend = _get_oval_blend(h, w, cx, cy, ew, eh)
+    frame[:] = ((frame.astype(np.uint16) * blend) >> 8).astype(np.uint8)
 
     # หาหน้าในวงรี + ชื่อ
     face_in_oval = False
@@ -255,24 +281,30 @@ def _draw_instruction_card(frame, main_text: str, sub_text: str, accent: tuple):
     cx = (w - cw) // 2
     cy = h - ch - cfg.CARD_MARGIN_BOTTOM
 
-    # เงา
-    shadow = frame.copy()
+    # เงา — ดำเฉพาะ shadow region (ไม่ addWeighted ทั้ง frame)
     so = cfg.CARD_SHADOW_OFF
-    cv2.rectangle(shadow, (cx+so, cy+so), (cx+cw+so, cy+ch+so), (0,0,0), -1)
-    frame[:] = cv2.addWeighted(frame, 1.0, shadow, cfg.CARD_SHADOW_ALPHA, 0)
+    sy1 = max(0, cy + so)
+    sy2 = min(h, cy + ch + so)
+    sx1 = max(0, cx + so)
+    sx2 = min(w, cx + cw + so)
+    frame[sy1:sy2, sx1:sx2] = (
+        frame[sy1:sy2, sx1:sx2].astype(np.float32) * (1.0 - cfg.CARD_SHADOW_ALPHA)
+    ).astype(np.uint8)
 
     # พื้น + accent + กรอบ
     cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), cfg.CARD_BG, -1)
     cv2.rectangle(frame, (cx, cy), (cx+cfg.CARD_ACCENT_W, cy+ch), accent, -1)
     cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), accent, 2)
 
-    # ข้อความ
+    # ข้อความ — ทำงานบน card ROI เท่านั้น (ไม่แปลง full frame เป็น PIL)
+    card_roi = frame[cy:cy+ch, cx:cx+cw]
     pl = cfg.CARD_PADDING_LEFT
-    draw_text(frame, main_text, (cx+pl, cy+cfg.CARD_MAIN_Y),
+    draw_text(card_roi, main_text, (pl, cfg.CARD_MAIN_Y),
               scale=cfg.CARD_FONT_MAIN, color=cfg.CARD_TEXT_MAIN)
     if sub_text:
-        draw_text(frame, sub_text, (cx+pl, cy+cfg.CARD_SUB_Y),
+        draw_text(card_roi, sub_text, (pl, cfg.CARD_SUB_Y),
                   scale=cfg.CARD_FONT_SUB, color=cfg.CARD_TEXT_SUB)
+    frame[cy:cy+ch, cx:cx+cw] = card_roi
 
 
 # ─── HUD ─────────────────────────────────────
@@ -291,7 +323,22 @@ def draw_hud(frame, fps, test_mode, checkout_done, remaining_sec=0):
 
 # ─── Side Panel (ใช้ cfg.PANEL_*) ───────────
 
+_panel_cache: dict = {"panel": None, "key": None, "tick": 0}
+
 def build_panel(persons: dict, liveness_map: dict, frame_height: int) -> np.ndarray:
+    # cache key: rebuild เมื่อ checked_in/out เปลี่ยน หรือ snapshot เปลี่ยน หรือทุก 15 frames
+    _panel_cache["tick"] = (_panel_cache["tick"] + 1) % 15
+    cache_key = (
+        tuple((n, p.checked_in, p.checked_out,
+               id(p.snapshot),
+               p.last_seen.strftime("%H:%M:%S") if p.last_seen else "-")
+              for n, p in persons.items()),
+        frame_height,
+    )
+    if _panel_cache["tick"] != 0 and _panel_cache["panel"] is not None and _panel_cache["key"] == cache_key:
+        return _panel_cache["panel"]
+    _panel_cache["key"] = cache_key
+
     W = cfg.PANEL_WIDTH
     panel = np.zeros((frame_height, W, 3), dtype=np.uint8)
     panel[:] = C.PANEL_BG
@@ -325,24 +372,36 @@ def build_panel(persons: dict, liveness_map: dict, frame_height: int) -> np.ndar
             cv2.rectangle(panel, (xf, y), (xf+FS, y+FS), C.FACE_PH, cv2.FILLED)
         cv2.rectangle(panel, (xf, y), (xf+FS, y+FS), color, 2)
 
-        tx = xf + FS + 8
-        draw_text(panel, name[:14], (tx, y+14), scale=0.40, color=C.TEXT_CYAN)
-        if person.first_seen:
-            cv2.putText(panel, f"IN: {person.first_seen.strftime('%H:%M:%S')}",
-                        (tx, y+FS-28), cv2.FONT_HERSHEY_SIMPLEX, 0.35, C.CHECKED_IN, 1)
-        if person.last_seen:
-            cv2.putText(panel, f"LST:{person.last_seen.strftime('%H:%M:%S')}",
-                        (tx, y+FS-14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, C.TEXT_DIM, 1)
+        tx  = xf + FS + 8
+        row = y + 14
+        GAP = 28 #
+        display = getattr(person, "display_name", name) or name
+        pid      = str(getattr(person, "employee_code", None) or "-")
+        dept     = str(getattr(person, "department",    None) or "-")
+        in_str   = person.first_seen.strftime("%H:%M:%S") if person.first_seen else "-"
+        lst_str  = person.last_seen.strftime("%H:%M:%S")  if person.last_seen  else "-"
 
-        if lv:
-            _, sl = get_face_visual(name, person, lv)
-            sl = sl.replace(f"{name} ", "").strip("[]")
-        else:
-            sl = "N/A"
-        cv2.putText(panel, sl[:30], (xf, y+FS+14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1)
+        # Name (Thai) — render บน name ROI เพื่อหลีกเลี่ยงการแปลง full panel เป็น PIL
+        name_h = GAP + 4
+        name_roi = panel[row-2:row-2+name_h, tx:tx+140]
+        if name_roi.size > 0:
+            draw_text(name_roi, display[:24], (0, 2), scale=0.36, color=C.TEXT_CYAN)
+            panel[row-2:row-2+name_h, tx:tx+140] = name_roi
+        row += GAP
+        cv2.putText(panel, f"PID: {pid[:15]}", (tx, row),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180, 180, 180), 1)
+        row += GAP
+        cv2.putText(panel, f"Dept:{dept[:13]}", (tx, row),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180, 180, 180), 1)
+        row += GAP
+        cv2.putText(panel, f"IN:  {in_str}", (tx, row),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, C.CHECKED_IN, 1)
+        row += GAP
+        cv2.putText(panel, f"LST: {lst_str}", (tx, row),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, C.TEXT_DIM, 1)
 
         y += ITEM_H
         cv2.line(panel, (5, y-4), (W-5, y-4), C.DIVIDER, 1)
 
+    _panel_cache["panel"] = panel
     return panel

@@ -202,7 +202,7 @@ class MotionAnalyzer:
 class TextureAnalyzer:
     """ตรวจ micro-texture ผิวหนัง — จอมือถือมี pixel pattern ต่างจากหน้าจริง"""
 
-    FACE_SIZE = 96   # resize ให้คงที่ก่อนวิเคราะห์
+    FACE_SIZE = 64   # resize ให้คงที่ก่อนวิเคราะห์ (64 เพียงพอ ลด compute ~44%)
 
     def _lbp_variance(self, gray: np.ndarray) -> float:
         """Local Binary Pattern variance"""
@@ -247,24 +247,26 @@ class TextureAnalyzer:
 class ScreenDetector:
     """ตรวจขอบจอ/กรอบมือถือรอบใบหน้า ด้วย Canny + HoughLines"""
 
-    def detect(self, gray_frame: np.ndarray, face_box: tuple, margin: int = 60) -> tuple:
+    def detect(self, bgr_frame: np.ndarray, face_box: tuple, margin: int = 60) -> tuple:
         """
         Returns: (is_screen: bool, ratio: float)
         face_box = (top, right, bottom, left)
         ต้องมีทั้งเส้นแนวนอนและแนวตั้งพร้อมกันจึงถือว่าเป็นจอ
         (หน้าคนจริงในห้องมักมีเส้นเพียงทิศทางเดียว เช่น ขอบประตู/หน้าต่าง)
+        แปลง BGR→Gray เฉพาะ ROI (ไม่แปลง full frame → ลด CPU)
         """
         top, right, bottom, left = face_box
-        fh, fw = gray_frame.shape[:2]
+        fh, fw = bgr_frame.shape[:2]
 
         y1 = max(0, top - margin)
         y2 = min(fh, bottom + margin)
         x1 = max(0, left - margin)
         x2 = min(fw, right + margin)
 
-        roi = gray_frame[y1:y2, x1:x2]
-        if roi.size == 0:
+        roi_bgr = bgr_frame[y1:y2, x1:x2]
+        if roi_bgr.size == 0:
             return False, 0.0
+        roi = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
         edges = cv2.Canny(roi, 50, 150)
         lines = cv2.HoughLinesP(
@@ -529,8 +531,8 @@ class LivenessEngine:
                 s.motion_ok = True
                 print(f"[MOTION OK] var={motion_val:.2f}")
 
-        # ─── ด่าน 3: Texture ───
-        if cfg.TEXTURE_ENABLED and not s.texture_ok:
+        # ─── ด่าน 3: Texture (เฉพาะ detection frames — ลด CPU load) ───
+        if cfg.TEXTURE_ENABLED and not s.texture_ok and do_detect:
             if face_crop is not None and face_crop.size > 0:
                 if self.texture.analyze(face_crop):
                     s.texture_pass += 1
@@ -540,8 +542,7 @@ class LivenessEngine:
 
         # ─── ด่าน 4: Screen Border ───
         if cfg.SCREEN_DETECT_ENABLED and s.screen_ok and do_detect:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            is_screen, ratio = self.screen.detect(gray, face_box)
+            is_screen, ratio = self.screen.detect(frame, face_box)
             if is_screen:
                 s.screen_ok = False
                 s.failed = True
@@ -594,7 +595,7 @@ class LivenessEngine:
             print(f"[CHALLENGE] Show {s.challenge_number} finger(s)")
             return
 
-        if s.challenge_phase != "active" or not do_detect:
+        if s.challenge_phase != "active":
             return
 
         # Timeout challenge นี้

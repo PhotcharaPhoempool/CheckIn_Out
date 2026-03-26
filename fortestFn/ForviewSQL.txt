@@ -1,22 +1,26 @@
-#main postgres
+#main postgres local
 sudo -u postgres psql
 
 
-
-#data base face_attendance
+#data base face_attendance local
 sudo -u postgres psql -d face_attendance
 
-#ViewData
+#data base face_attendance Online
+psql -h 0.tcp.ap.ngrok.io -p [NewnumPort] -U beam -d face_db
+
+#ViewNewDataBase
 SELECT 
     a.id,
     e.employee_code,
-    e.full_name,
+    CONCAT(e.title, ' ', e.first_name, ' ', e.last_name) AS full_name,
     a.check_time,
     a.status,
     a.camera_name
 FROM attendance_logs a
-JOIN employees e ON a.employee_id = e.id
+JOIN employees e ON a.employee_code = e.employee_code
 ORDER BY a.check_time DESC;
 
 #Reset data
 TRUNCATE TABLE attendance_logs RESTART IDENTITY;
+
+อยากให้นายแก้ไขเรื่องที่Fpsมันต่ำมากจากเดิมที่เคยวิ่งที่20-30fps ตอนนี้มันได้แค่ 6 และอยากให้แก้ไขให้แสดงขข้อมูลทางขวาให้ครบถ้วน ตามรูปที่ส่งไปให้โดยข้อมูลก็ดึงมาจากถ้าข้อมูล

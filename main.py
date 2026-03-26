@@ -10,6 +10,34 @@ main.py — Main loop (InsightFace / ArcFace)
 """
 
 import os
+import sys
+import glob
+
+
+def _ensure_nvidia_libs():
+    """
+    ตั้ง LD_LIBRARY_PATH ให้ชี้ไปที่ CUDA/cuDNN libs ใน venv ก่อน
+    เพื่อให้ onnxruntime-gpu ใช้ GPU ได้โดยไม่ crash
+    re-exec ตัวเองถ้าต้องการ
+    """
+    if os.environ.get("_NVIDIA_LIBS_SET"):
+        return
+    venv_prefix = os.path.dirname(os.path.dirname(sys.executable))
+    nvidia_paths = sorted(glob.glob(
+        f"{venv_prefix}/lib/python*/site-packages/nvidia/*/lib"
+    ))
+    if not nvidia_paths:
+        return
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    new_path = ":".join(nvidia_paths) + (":" + existing if existing else "")
+    os.environ["LD_LIBRARY_PATH"] = new_path
+    os.environ["_NVIDIA_LIBS_SET"] = "1"
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    os.execv(sys.executable, [sys.executable, "-u"] + sys.argv)
+
+
+_ensure_nvidia_libs()
+
 import cv2
 import pickle
 import numpy as np
@@ -51,19 +79,14 @@ def landmarks_68_to_dict(pts) -> dict:
 
 
 # ─── Face Matching (cosine similarity) ──────
-def identify_face(embedding, known_encodings, known_names) -> str:
-    """เทียบ 512d embedding กับฐานข้อมูล ด้วย cosine similarity"""
-    if len(known_encodings) == 0:
+def identify_face(embedding, known_norms: np.ndarray, known_names) -> str:
+    """เทียบ 512d embedding กับฐานข้อมูล ด้วย cosine similarity (vectorized)
+    known_norms: pre-normalized matrix (N, 512) สร้างครั้งเดียวตอน startup"""
+    if known_norms is None or len(known_norms) == 0:
         return "Unknown"
-
-    # คำนวณ cosine similarity กับทุกคนในฐานข้อมูล
-    sims = []
     emb_norm = embedding / (norm(embedding) + 1e-10)
-    for known_emb in known_encodings:
-        known_norm = known_emb / (norm(known_emb) + 1e-10)
-        sims.append(np.dot(emb_norm, known_norm))
-
-    best_idx = np.argmax(sims)
+    sims = known_norms @ emb_norm          # (N,512) @ (512,) → (N,)
+    best_idx = int(np.argmax(sims))
     if sims[best_idx] >= cfg.FACE_TOLERANCE:
         return known_names[best_idx]
     return "Unknown"
@@ -80,17 +103,38 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
         )
     with open(cfg.ENCODINGS_FILE, "rb") as f:
         data = pickle.load(f)
-    known_encodings = data["encodings"]
-    known_names     = data["names"]
+    known_names = data["names"]
+    # Pre-normalize embeddings เป็น matrix ครั้งเดียว → ใช้ vectorized dot product
+    _raw = np.array(data["encodings"], dtype=np.float32)
+    known_norms = _raw / (np.linalg.norm(_raw, axis=1, keepdims=True) + 1e-10)
     print(f"[DB] โหลด {len(known_names)} คน จาก {cfg.ENCODINGS_FILE}")
 
     # ─── InsightFace ───
     from insightface.app import FaceAnalysis
+    import onnxruntime as ort
 
-    app = FaceAnalysis(
-        name="buffalo_l",
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-    )
+    # Auto-detect — ใช้เฉพาะ provider ที่พร้อมจริง (ไม่ error อีก)
+    # Auto-detect GPU — กรอง TensorRT ออก (ต้องลง TensorRT แยก)
+    available = ort.get_available_providers()
+    use_providers = [p for p in available if p != "TensorrtExecutionProvider"]
+    print(f"[ORT] Using: {use_providers}")
+
+    # ใช้เฉพาะ models ที่จำเป็น — ข้าม genderage + 2d106det (ไม่ได้ใช้ ลด inference 2/5)
+    _needed = ["detection", "landmark_3d_68", "recognition"]
+    try:
+        app = FaceAnalysis(
+            name="buffalo_l",
+            providers=use_providers,
+            allowed_modules=_needed,
+        )
+    except Exception as e:
+        print(f"[WARN] GPU ใช้ไม่ได้: {e}")
+        print("[WARN] Fallback → CPU")
+        app = FaceAnalysis(
+            name="buffalo_l",
+            providers=["CPUExecutionProvider"],
+            allowed_modules=_needed,
+        )
     app.prepare(ctx_id=0, det_size=cfg.DET_SIZE)
     print(f"[ARCFACE] InsightFace ready  det_size={cfg.DET_SIZE}")
 
@@ -185,7 +229,7 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
             for lv in session.liveness.values()
             if not lv.confirmed and not lv.failed
         )
-        if has_challenge and do_detect:
+        if has_challenge:   # ทุกเฟรม (ไม่ขึ้นกับ do_detect) → จับนิ้วแม่นขึ้น
             hand_results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
         # ─── Reset expired ───
@@ -202,7 +246,12 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
             last_faces = []
             last_face_ts = now_ts
 
-        orig_frame = frame.copy()
+        # copy frame เฉพาะเมื่อมีคนที่ยังไม่ได้ snapshot (ประหยัด copy ส่วนใหญ่)
+        _need_snapshot = any(
+            not p.checked_in
+            for p in session.persons.values()
+        ) or not session.persons
+        orig_frame = frame.copy() if _need_snapshot else frame
 
         # ─── Oval params ───
         fh, fw = frame.shape[:2]
@@ -233,7 +282,7 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
 
             # ── Identify (ArcFace 512d) ──
             embedding = face.embedding
-            name = identify_face(embedding, known_encodings, known_names)
+            name = identify_face(embedding, known_norms, known_names)
 
             _face_with_names.append((face_box, name))
 

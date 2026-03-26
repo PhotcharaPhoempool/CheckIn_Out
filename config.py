@@ -11,8 +11,8 @@ from datetime import time as dtime
 # ╚═══════════════════════════════════════════╝
 ENCODINGS_FILE        = "encodings.pkl"
 FACE_TOLERANCE        = 0.35      # cosine similarity ขั้นต่ำ (ArcFace ใช้ 0.3-0.4)
-DET_SIZE              = (640, 640)  # ขนาดภาพสำหรับ detection (insightface)
-PANEL_WIDTH           = 200
+DET_SIZE              = (320, 320)  # ขนาดภาพสำหรับ detection (320=เร็ว, 640=แม่น)
+PANEL_WIDTH           = 250
 
 # ╔═══════════════════════════════════════════╗
 # ║  โหมดทดสอบ                                 ║
@@ -24,7 +24,7 @@ CHECKOUT_TIME         = dtime(22, 0)
 # ╔═══════════════════════════════════════════╗
 # ║  Performance                              ║
 # ╚═══════════════════════════════════════════╝
-DETECT_EVERY_N_FRAMES = 2
+DETECT_EVERY_N_FRAMES = 4 #MAX Skip frames between detections
 FULLSCREEN            = True
 CAMERA_FLIP           = True
 
@@ -64,7 +64,7 @@ SCREEN_EDGE_MAX       = 0.18
 CHALLENGE_ENABLED     = True
 CHALLENGE_COUNT       = 1
 CHALLENGE_TIMEOUT     = 6.0
-CHALLENGE_HOLD_FRAMES = 4
+CHALLENGE_HOLD_FRAMES = 2
 CHALLENGE_NEAR_FACE   = True
 CHALLENGE_PROXIMITY   = 1.5
 
@@ -73,14 +73,14 @@ CHALLENGE_PROXIMITY   = 1.5
 # ╚═══════════════════════════════════════════╝
 FAS_ENABLED           = True
 FAS_THRESHOLD         = 0.5
-FAS_CHECK_EVERY       = 5
+FAS_CHECK_EVERY       = 10
 FAS_REQUIRED_REAL     = 2
 FAS_DETECTOR_BACKEND  = "skip"
 
 # ╔═══════════════════════════════════════════╗
 # ║  UI: General                              ║
 # ╚═══════════════════════════════════════════╝
-SHOW_LANDMARKS        = True
+SHOW_LANDMARKS        = False
 NO_FACE_RESET_SEC     = 5
 
 # ╔═══════════════════════════════════════════╗
