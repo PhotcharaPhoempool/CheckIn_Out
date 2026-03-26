@@ -40,6 +40,11 @@ class LivenessState:
     centers: deque = field(default_factory=lambda: deque(maxlen=cfg.DEPTH_FRAMES_WINDOW))
     motion_ok: bool = False
 
+    # ด่าน 2.5: Blink
+    blink_ok: bool = not cfg.BLINK_ENABLED
+    blink_count: int = 0
+    _blink_eye_closed: bool = False   # ตาหลับในเฟรมก่อนหน้า
+
     # ด่าน 3: Texture
     texture_pass: int = 0
     texture_ok: bool = not cfg.TEXTURE_ENABLED
@@ -69,9 +74,9 @@ class LivenessState:
         return self.failed
 
     def all_passive_passed(self) -> bool:
-        """ด่าน 1-4 + ด่าน 6 ผ่านหมดแล้วหรือยัง"""
-        return (self.depth_ok and self.motion_ok and self.texture_ok
-                and self.screen_ok and self.fas_ok)
+        """ด่าน 1-4 + ด่าน 2.5 + ด่าน 6 ผ่านหมดแล้วหรือยัง"""
+        return (self.depth_ok and self.motion_ok and self.blink_ok
+                and self.texture_ok and self.screen_ok and self.fas_ok)
 
     def all_passed(self) -> bool:
         """ทุกด่านผ่าน"""
@@ -197,6 +202,42 @@ class MotionAnalyzer:
 
 
 # ─────────────────────────────────────────────
+# ด่าน 2.5: Blink Detection (Eye Aspect Ratio)
+# ─────────────────────────────────────────────
+class BlinkDetector:
+    """
+    ตรวจการกะพริบตา ด้วย Eye Aspect Ratio (EAR)
+    ใช้ left_eye + right_eye จาก 68-point landmark ที่มีอยู่แล้ว — ไม่กิน CPU เพิ่ม
+
+    EAR = (||p1-p5|| + ||p2-p4||) / (2 * ||p0-p3||)
+    ตาเปิด: EAR ≈ 0.28-0.35   ตาหลับ: EAR < BLINK_EAR_THRESH
+
+    รูปภาพ/วิดีโอนิ่ง: EAR คงที่ ไม่มี blink → ไม่ผ่าน
+    """
+
+    @staticmethod
+    def _dist(a, b) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    @classmethod
+    def ear(cls, eye_pts: list) -> float:
+        """คำนวณ Eye Aspect Ratio จาก 6 จุด (dlib/InsightFace order)"""
+        if len(eye_pts) < 6:
+            return 1.0   # assume open ถ้าไม่มีข้อมูล
+        p = eye_pts
+        vertical = cls._dist(p[1], p[5]) + cls._dist(p[2], p[4])
+        horizontal = cls._dist(p[0], p[3])
+        return vertical / (2.0 * horizontal + 1e-6)
+
+    @classmethod
+    def avg_ear(cls, lm: dict) -> float:
+        """EAR เฉลี่ยตาซ้าย-ขวา"""
+        l = cls.ear(lm.get("left_eye", []))
+        r = cls.ear(lm.get("right_eye", []))
+        return (l + r) / 2.0
+
+
+# ─────────────────────────────────────────────
 # ด่าน 3: Texture Analysis
 # ─────────────────────────────────────────────
 class TextureAnalyzer:
@@ -247,14 +288,16 @@ class TextureAnalyzer:
 class ScreenDetector:
     """ตรวจขอบจอ/กรอบมือถือรอบใบหน้า ด้วย Canny + HoughLines"""
 
-    def detect(self, bgr_frame: np.ndarray, face_box: tuple, margin: int = 60) -> tuple:
+    def detect(self, bgr_frame: np.ndarray, face_box: tuple) -> tuple:
         """
         Returns: (is_screen: bool, ratio: float)
         face_box = (top, right, bottom, left)
-        ต้องมีทั้งเส้นแนวนอนและแนวตั้งพร้อมกันจึงถือว่าเป็นจอ
-        (หน้าคนจริงในห้องมักมีเส้นเพียงทิศทางเดียว เช่น ขอบประตู/หน้าต่าง)
-        แปลง BGR→Gray เฉพาะ ROI (ไม่แปลง full frame → ลด CPU)
+
+        ตรวจเฉพาะเส้นที่อยู่ในแถบขอบ ROI (margin zone) รอบหน้า:
+          - Phone/tablet border จะอยู่ชิดหน้า → ตกใน margin zone → นับ
+          - Background (ชั้น, จอคอม, ผนัง) อยู่ไกลกว่า → ตกนอก margin zone → ไม่นับ
         """
+        margin = cfg.SCREEN_MARGIN
         top, right, bottom, left = face_box
         fh, fw = bgr_frame.shape[:2]
 
@@ -266,32 +309,41 @@ class ScreenDetector:
         roi_bgr = bgr_frame[y1:y2, x1:x2]
         if roi_bgr.size == 0:
             return False, 0.0
+        rh, rw = roi_bgr.shape[:2]
         roi = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
         edges = cv2.Canny(roi, 50, 150)
         lines = cv2.HoughLinesP(
-            edges, 1, np.pi / 180, threshold=40,
-            minLineLength=min(roi.shape[:2]) // 3,
-            maxLineGap=10,
+            edges, 1, np.pi / 180, threshold=30,
+            minLineLength=min(rh, rw) // 4,
+            maxLineGap=8,
         )
         if lines is None:
             return False, 0.0
 
-        perimeter = 2 * (roi.shape[0] + roi.shape[1])
-        h_total = 0.0   # เส้นแนวนอน
-        v_total = 0.0   # เส้นแนวตั้ง
+        # แบ่ง ROI เป็น "edge zone" (margin px) รอบนอก กับ "center" (พื้นที่หน้า)
+        # นับเฉพาะเส้นที่ midpoint อยู่ใน edge zone — phone border อยู่ที่นี่
+        edge_h = 0.0   # เส้นแนวนอนในแถบขอบ
+        edge_v = 0.0   # เส้นแนวตั้งในแถบขอบ
         for line in lines:
             x1l, y1l, x2l, y2l = line[0]
+            mx, my = (x1l + x2l) / 2, (y1l + y2l) / 2
             length = math.hypot(x2l - x1l, y2l - y1l)
             angle  = abs(math.atan2(y2l - y1l, x2l - x1l))
-            if angle < 0.18 or abs(angle - math.pi) < 0.18:
-                h_total += length
-            elif abs(angle - math.pi / 2) < 0.18:
-                v_total += length
 
-        # ใช้ค่าต่ำสุดของทั้งสองทิศทาง → ต้องมีทั้งคู่จึงนับ
-        min_edge = min(h_total, v_total)
-        ratio = min_edge / perimeter if perimeter > 0 else 0
+            # เส้นอยู่ใน edge zone หรือไม่
+            in_h_zone = my < margin or my > rh - margin   # แถบบน/ล่าง
+            in_v_zone = mx < margin or mx > rw - margin   # แถบซ้าย/ขวา
+
+            if angle < 0.18 or abs(angle - math.pi) < 0.18:   # แนวนอน
+                if in_h_zone:
+                    edge_h += length
+            elif abs(angle - math.pi / 2) < 0.18:             # แนวตั้ง
+                if in_v_zone:
+                    edge_v += length
+
+        perimeter = 2 * (rh + rw)
+        ratio = min(edge_h, edge_v) / perimeter if perimeter > 0 else 0
         return ratio > cfg.SCREEN_EDGE_MAX, ratio
 
 
@@ -482,6 +534,7 @@ class LivenessEngine:
     def __init__(self):
         self.depth    = DepthAnalyzer()
         self.motion   = MotionAnalyzer()
+        self.blink    = BlinkDetector()
         self.texture  = TextureAnalyzer()
         self.screen   = ScreenDetector()
         self.finger   = FingerChallenge()
@@ -504,6 +557,7 @@ class LivenessEngine:
             reasons = []
             if not s.depth_ok:     reasons.append("Depth")
             if not s.motion_ok:    reasons.append("Motion")
+            if not s.blink_ok:     reasons.append("Blink")
             if not s.texture_ok:   reasons.append("Texture")
             if not s.screen_ok:    reasons.append("Screen")
             if not s.fas_ok:       reasons.append("FAS")
@@ -530,6 +584,20 @@ class LivenessEngine:
             if motion_val >= cfg.MOTION_VAR_MIN:
                 s.motion_ok = True
                 print(f"[MOTION OK] var={motion_val:.2f}")
+
+        # ─── ด่าน 2.5: Blink ───
+        if cfg.BLINK_ENABLED and not s.blink_ok and do_detect and lm:
+            ear_val = BlinkDetector.avg_ear(lm)
+            if ear_val < cfg.BLINK_EAR_THRESH:
+                s._blink_eye_closed = True
+            elif s._blink_eye_closed:
+                # ตาเพิ่งเปิด → บลิงค์ครั้งหนึ่งสมบูรณ์
+                s.blink_count += 1
+                s._blink_eye_closed = False
+                print(f"[BLINK] {s.blink_count}/{cfg.BLINK_MIN}  EAR={ear_val:.3f}")
+                if s.blink_count >= cfg.BLINK_MIN:
+                    s.blink_ok = True
+                    print("[BLINK OK]")
 
         # ─── ด่าน 3: Texture (เฉพาะ detection frames — ลด CPU load) ───
         if cfg.TEXTURE_ENABLED and not s.texture_ok and do_detect:
@@ -574,7 +642,7 @@ class LivenessEngine:
 
         # ─── ด่าน 5: Finger Challenge ───
         if cfg.CHALLENGE_ENABLED and not s.challenge_ok and s.all_passive_passed() and not s.failed:
-            self._update_challenge(s, hand_results, face_box, face_width, frame, now_ts, do_detect)
+            self._update_challenge(s, hand_results, face_box, face_width, frame, now_ts)
 
         # ─── ตรวจว่าผ่านทุกด่าน ───
         if s.all_passed() and not s.confirmed:
@@ -583,7 +651,7 @@ class LivenessEngine:
 
     def _update_challenge(self, s: LivenessState, hand_results,
                           face_box: tuple, face_width: int,
-                          frame: np.ndarray, now_ts: float, do_detect: bool):
+                          frame: np.ndarray, now_ts: float):
         """จัดการ finger challenge"""
 
         # เริ่ม challenge ครั้งแรก

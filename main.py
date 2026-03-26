@@ -139,7 +139,10 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
     print(f"[ARCFACE] InsightFace ready  det_size={cfg.DET_SIZE}")
 
     # ─── เปิดกล้อง ───
-    cam = ThreadedCamera(camera_index)
+    cam_src = cfg.CAMERA_URL if cfg.CAMERA_URL else camera_index
+    if cfg.CAMERA_URL:
+        print(f"[CAM] IP camera: {cfg.CAMERA_URL}")
+    cam = ThreadedCamera(cam_src)
 
     # ─── MediaPipe Hands ───
     hands = mp.solutions.hands.Hands(

@@ -22,11 +22,26 @@ TEST_DURATION_SECONDS = 60
 CHECKOUT_TIME         = dtime(22, 0)
 
 # ╔═══════════════════════════════════════════╗
+# ║  กล้อง (IP Camera / USB)                  ║
+# ╚═══════════════════════════════════════════╝
+# ตั้งค่า CAMERA_URL เพื่อใช้ IP camera (ถ้า None จะใช้ camera_index ใน main.py)
+# รูปแบบ RTSP ที่พบบ่อย — ลองทีละอัน:
+#   CAMERA_URL = "rtsp://192.168.1.13/stream"
+#   CAMERA_URL = "rtsp://192.168.1.13:554/stream"
+#   CAMERA_URL = "rtsp://admin:admin@192.168.1.13:554/stream"
+#   CAMERA_URL = "rtsp://admin:admin@192.168.1.13:554/Streaming/Channels/101"   # Hikvision
+#   CAMERA_URL = "rtsp://admin:admin@192.168.1.13:554/cam/realmonitor?channel=1&subtype=0"  # Dahua
+#   CAMERA_URL = "http://192.168.1.13:8080/?action=stream"  # MJPEG (IP Webcam app)
+CAMERA_URL            = "rtsp://admin:@dmin123456@192.168.1.13:554/unicast/c1/s0/live"
+
+
+# ╔═══════════════════════════════════════════╗
 # ║  Performance                              ║
 # ╚═══════════════════════════════════════════╝
 DETECT_EVERY_N_FRAMES = 4 #MAX Skip frames between detections
 FULLSCREEN            = True
-CAMERA_FLIP           = True
+# IP camera ส่งภาพตรง (ไม่กลับซ้าย-ขวา) → ตั้ง False ถ้าใช้ CAMERA_URL
+CAMERA_FLIP           = False
 
 # ╔═══════════════════════════════════════════╗
 # ║  Anti-Spoofing: ด่าน 1 — Landmark Depth   ║
@@ -44,6 +59,15 @@ DEPTH_SYMMETRY_MIN    = 0.002
 # ╚═══════════════════════════════════════════╝
 MOTION_VAR_MIN        = 1.2       # ปรับเพราะ ArcFace ใช้ full-res landmarks (เดิม 0.3 ที่ 0.25x)
 
+# ╔════════════════════════════════════════════╗
+# ║  Anti-Spoofing: ด่าน 2.5 — Blink Detection ║
+# ╚════════════════════════════════════════════╝
+# ตรวจว่าตากะพริบจริง — รูปภาพ/วิดีโอนิ่งไม่กะพริบ → fail
+# คำนวณจาก Eye Aspect Ratio (EAR) ของ 68-point landmark ที่มีอยู่แล้ว (ฟรี)
+BLINK_ENABLED         = True
+BLINK_EAR_THRESH      = 0.21     # EAR ต่ำกว่านี้ = ตาหลับ (ค่าปกติเปิด ~0.28-0.35)
+BLINK_MIN             = 2        # ต้องกะพริบอย่างน้อย N ครั้ง
+
 # ╔═══════════════════════════════════════════╗
 # ║  Anti-Spoofing: ด่าน 3 — Texture          ║
 # ╚═══════════════════════════════════════════╝
@@ -56,7 +80,13 @@ TEXTURE_CHROMA_MIN    = 6.0
 # ║  Anti-Spoofing: ด่าน 4 — Screen Border    ║
 # ╚═══════════════════════════════════════════╝
 SCREEN_DETECT_ENABLED = True
-SCREEN_EDGE_MAX       = 0.18
+# SCREEN_MARGIN: pixels รอบหน้าที่จะตรวจ (เล็ก = ไม่จับพื้นหลัง, ใหญ่ = ไวกว่า)
+# Phone/tablet border อยู่ชิดหน้า <20px → ตรวจได้แม้ margin เล็ก
+# พื้นหลัง (ชั้น/จอคอม) อยู่ห่างกว่า → margin เล็กไม่จับ
+SCREEN_MARGIN         = 20
+# SCREEN_EDGE_MAX: สัดส่วน min(H,V) / perimeter ที่จะถือว่าเป็นจอ
+# ต้องมีเส้น H+V ที่ชิดหน้ารวมกันมากพอ (เพิ่มจาก 0.18 → 0.40 ลด false positive)
+SCREEN_EDGE_MAX       = 0.40
 
 # ╔═══════════════════════════════════════════╗
 # ║  Anti-Spoofing: ด่าน 5 — Finger Challenge ║
