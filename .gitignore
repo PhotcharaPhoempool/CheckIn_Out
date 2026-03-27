@@ -59,3 +59,4 @@ config.local.py
 # Other
 .claude/
 known_faces/
+Report/Day/

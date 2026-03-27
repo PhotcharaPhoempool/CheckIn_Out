@@ -1,0 +1,20 @@
+# Windows requirements — Face Attendance System
+# ติดตั้ง: pip install -r requirements_win.txt
+# หรือใช้ install.bat (แนะนำ)
+
+numpy>=1.26
+opencv-python>=4.9
+pillow>=10.0
+mediapipe>=0.10
+insightface>=0.7
+
+# เลือกอันใดอันหนึ่ง:
+# onnxruntime-gpu    # ถ้ามี NVIDIA GPU (ต้องติดตั้ง CUDA Toolkit ด้วย)
+onnxruntime>=1.18    # CPU fallback
+
+# Database
+psycopg[binary]>=3.1
+
+# Optional (ด่าน FAS - ช้ามาก ถ้าไม่ต้องการให้ปิด FAS_ENABLED=False)
+# deepface
+# tf-keras

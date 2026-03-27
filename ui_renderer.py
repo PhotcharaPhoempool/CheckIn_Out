@@ -130,8 +130,21 @@ def get_face_visual(name, person, liveness):
         dn = len(liveness.challenge_done)
         return C.CHALLENGE, f"{display} [Show {cn} ({dn+1}/{cfg.CHALLENGE_COUNT})]"
     if not liveness.confirmed:
+        # แสดงด่านที่กำลัง block อยู่
         dp = liveness.depth_pass_count
-        return C.LIVENESS, f"{display} [Scan {dp}/{cfg.DEPTH_FRAMES_REQUIRED}]"
+        if dp < cfg.DEPTH_FRAMES_REQUIRED:
+            tag = f"Scan {dp}/{cfg.DEPTH_FRAMES_REQUIRED}"
+        elif cfg.BLINK_ENABLED and not liveness.blink_ok:
+            tag = f"Blink {liveness.blink_count}/{cfg.BLINK_MIN}"
+        elif not liveness.motion_ok:
+            tag = "Move"
+        elif not liveness.texture_ok:
+            tag = "Texture"
+        elif not liveness.fas_ok:
+            tag = "AI"
+        else:
+            tag = "Wait"
+        return C.LIVENESS, f"{display} [{tag}]"
     if person.checked_out:
         return C.CHECKED_OUT, display
     if person.checked_in:
@@ -240,13 +253,30 @@ def draw_face_guide(frame, face_boxes_full: list, liveness_map: dict,
             sub_text = f"Step {dn+1}/{cfg.CHALLENGE_COUNT}  |  {rem:.1f}s left"
         else:
             dp = lv.depth_pass_count
-            m = "OK" if lv.motion_ok else "--"
-            t = "OK" if lv.texture_ok else "--"
-            s = "OK" if lv.screen_ok else "FAIL"
-            f = "OK" if lv.fas_ok else (f"{lv.fas_score:.1f}" if lv.fas_score >= 0 else "--")
+            m  = "OK" if lv.motion_ok  else "--"
+            bk = f"{lv.blink_count}/{cfg.BLINK_MIN}" if not lv.blink_ok else "OK"
+            t  = "OK" if lv.texture_ok else "--"
+            s  = "OK" if lv.screen_ok  else "FAIL"
+            f  = "OK" if lv.fas_ok     else (f"{lv.fas_score:.1f}" if lv.fas_score >= 0 else "--")
             oval_color = C.LIVENESS
-            main_text = f"Hold still...  {dp}/{cfg.DEPTH_FRAMES_REQUIRED}"
-            sub_text = f"Motion {m}  Tex {t}  Scr {s}  FAS {f}"
+
+            # แสดงว่ากำลังรอด่านไหน
+            if dp < cfg.DEPTH_FRAMES_REQUIRED:
+                main_text = f"Hold still...  {dp}/{cfg.DEPTH_FRAMES_REQUIRED}"
+            elif cfg.BLINK_ENABLED and not lv.blink_ok:
+                main_text = f"Please blink  {lv.blink_count}/{cfg.BLINK_MIN}"
+            elif not lv.motion_ok:
+                main_text = "Move your head slightly"
+            elif not lv.texture_ok:
+                main_text = "Hold still (texture)..."
+            elif not lv.fas_ok:
+                main_text = "Hold still (AI check)..."
+            else:
+                main_text = "Hold still..."
+
+            bk_part  = f"  Blink {bk}" if cfg.BLINK_ENABLED else ""
+            scr_part = f"  Scr {s}" if cfg.SCREEN_DETECT_ENABLED else ""
+            sub_text = f"Mot {m}{bk_part}  Tex {t}{scr_part}  FAS {f}"
     elif face_in_oval:
         oval_color, main_text = C.LIVENESS, "Hold still..."
 
@@ -259,8 +289,9 @@ def draw_face_guide(frame, face_boxes_full: list, liveness_map: dict,
 
 
 def _format_fail_reason(reason: str) -> str:
-    labels = {"Depth": "Face depth", "Motion": "No movement", "Texture": "Texture",
-              "Screen": "Screen detected", "Finger": "Finger", "FAS": "AI spoof detected"}
+    labels = {"Depth": "Face depth", "Motion": "No movement", "Blink": "No blink",
+              "Texture": "Texture", "Screen": "Screen detected",
+              "Finger": "Finger", "FAS": "AI spoof detected"}
     if reason.startswith("FAIL:"):
         return " + ".join(labels.get(p, p) for p in reason[5:].split("+"))
     if reason.startswith("Screen"):
