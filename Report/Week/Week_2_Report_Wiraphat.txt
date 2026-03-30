@@ -1,0 +1,148 @@
+## รายงานประจำสัปดาห์ — 20 มีนาคม 2569 ถึง 27 มีนาคม 2569
+
+================================================================================
+
+### สิ่งที่ทำ
+
+สัปดาห์นี้เป็นสัปดาห์ที่มีการพัฒนาหนักมาก เริ่มจากการวาง architecture ใหม่ทั้งหมด
+ไล่ผ่าน Version 3 → 4 → 5 → 6 → 7 จนถึงการปรับปรุง config, UI และ Windows Version
+รวมทั้งสิ้น 6 commits + งานวันศุกร์ที่ยังไม่ commit แยกเล่าเป็นรายวันดังนี้
+
+---
+
+วันพฤหัสบดีที่ 23 มีนาคม 2569
+--------------------------------
+(Commit: "Version 3 update" + "update requirement")
+
+วันนี้ทำการ refactor ระบบทั้งหมดจาก face_camera_runner.py ไฟล์เดียว
+มาเป็นโครงสร้างแบบ modular ที่แยกหน้าที่ชัดเจนขึ้น โดยสร้างไฟล์ใหม่ 6 ไฟล์:
+
+- camera.py      : ThreadedCamera สำหรับอ่านภาพจากกล้อง
+- config.py      : รวมค่า config ทั้งหมดไว้ที่เดียว
+- liveness_engine.py : Anti-Spoofing pipeline
+- main.py        : Main loop ใหม่ที่ใช้ module ต่าง ๆ
+- session_manager.py : จัดการ check-in / check-out
+- ui_renderer.py : วาด UI ทั้งหมด (overlay, panel, HUD)
+
+นอกจากนี้ยังอัปเดต requirements.txt ให้ครบ (numpy, opencv-python, insightface,
+onnxruntime-gpu, mediapipe, dlib ฯลฯ) และเพิ่ม ForviewSQL.txt สำหรับดู database
+
+---
+
+วันอังคารที่ 24 มีนาคม 2569
+------------------------------
+(Commit: "Version 4 Update" + "Version 5(ArcFace) Update")
+
+วันนี้มี 2 commit ต่อเนื่องกัน
+
+Version 4: เพิ่ม Anti-Spoofing pipeline ให้ครบทุกด่าน
+  - liveness_engine.py ถูกขยายใหญ่มาก เพิ่มด่าน Landmark Depth, Micro-Motion,
+    Texture (LBP+Laplacian+Chroma), Screen Border, Finger Challenge (MediaPipe Hands),
+    และ MiniFASNet ครบ pipeline
+  - ui_renderer.py ปรับให้แสดง liveness status, HUD แสดงผลแต่ละด่าน
+  - เพิ่ม session_manager.py ที่สมบูรณ์
+  - เพิ่มไฟล์ test: test_gaussian_fourier.py, test_minifas_spoof.py, testfo.py
+    สำหรับทดสอบ algorithm ก่อน integrate
+
+
+วันพฤหัสบดีที่ 25 มีนาคม 2569
+---------------------------------
+Version 5 (ArcFace): เปลี่ยน face recognition engine
+  - เปลี่ยนจาก face_recognition library (dlib) มาใช้ InsightFace ArcFace 512d
+    ซึ่งแม่นยำกว่าและรองรับ GPU ได้ดีกว่า
+  - สร้าง encode_faces_arcface.py แทน encode_faces.py เดิม
+  - config.py ถูกขยายจาก 50 → 171 บรรทัด เพิ่ม parameter ทุกด่าน anti-spoof
+  - main.py และ ui_renderer.py ถูก refactor ใหม่ใหญ่มาก (280 และ 331 บรรทัด)
+  - จัดโครงสร้างโฟลเดอร์: ย้ายไฟล์ทดสอบไปรวมไว้ใน fortestFn/
+  - .gitignore อัปเดตเพื่อ ignore model files และ encodings.pkl
+
+---
+
+วันพฤหัสบดีที่ 26 มีนาคม 2569
+---------------------------------
+(Commit: "Version 6 migrate data base & fix gpu bug" + "Version 7 change to use ip camera")
+
+วันนี้มี 2 commit ต่อเนื่องกัน
+
+Version 6: Migrate Database และแก้ GPU Bug
+  - attendance_db.py ถูก refactor ใหม่ทั้งหมด รองรับ schema ใหม่ที่มี employee_code
+    เป็น primary key แทน auto increment id, เพิ่ม title/first_name/last_name
+  - สร้าง migrate_db.sql สำหรับ migrate database เก่าไป schema ใหม่
+  - สร้าง import_csv.py: tool สำหรับ import ข้อมูลพนักงานจาก CSV เข้า database
+  - สร้าง dbcopy.py: utility สำหรับ backup/copy database
+  - สร้าง urls.json: เก็บรายการ RTSP URL ของกล้องต่าง ๆ
+  - แก้ GPU bug ใน encode_faces_arcface.py และ liveness_engine.py
+  - session_manager.py และ ui_renderer.py ถูก refactor เพิ่ม panel ขวา
+
+Version 7: เปลี่ยนมาใช้ IP Camera
+  - camera.py ปรับ ThreadedCamera ให้รองรับ RTSP URL ของ IP camera (UNV OWLView)
+    RTSP: rtsp://admin:@dmin123456@192.168.1.13:554/unicast/c1/s0/live
+  - config.py เพิ่ม CAMERA_URL และ CAMERA_FLIP สำหรับ IP camera
+    ตั้ง CAMERA_FLIP = False (IP camera ส่งภาพตรงไม่ต้องกลับ)
+  - liveness_engine.py ปรับ sensitivity หลายด่านให้เหมาะกับ IP camera
+    ที่มี resolution ต่างจาก USB webcam
+
+---
+
+วันศุกร์ที่ 27 มีนาคม 2569
+------------------------------
+(ยังไม่ commit — unstaged changes ใน config.py, ui_renderer.py + Win_Ver/ ใหม่)
+
+วันนี้เน้นการปรับ Anti-Spoofing หลังทดสอบกับกล้อง IP จริงแล้วพบปัญหา
+และสร้าง Windows Version สำหรับ deploy บน Windows PC
+
+แก้ปัญหา Screen Border Detection (Linux):
+  - กล้อง IP wide-angle fisheye ทำให้ขอบประตู/ตู้ในพื้นหลังดูชิดหน้าในภาพ
+    Screen Border Detection (ด่าน 4) ทำ false positive ตลอดเวลา
+  - แก้ไขโดยปิด SCREEN_DETECT_ENABLED = False และชดเชยด้วย
+    Finger Challenge 2 ชุด (จาก 1), timeout 8 วินาที (จาก 6),
+    MiniFASNet threshold 0.55 (จาก 0.5), ตรวจทุก 5 เฟรม (จาก 10),
+    ต้องผ่าน 3 ครั้ง (จาก 2)
+
+สร้าง Profile System (Linux):
+  - เพิ่ม Profile Loader ท้าย config.py รองรับ argument หรือ env var
+  - สร้าง profiles/cam_main.py (IP camera), cam_usb.py (USB webcam), test.py (dev mode)
+
+ปรับ UI Liveness (Linux):
+  - แสดงด่านที่กำลัง block จริง ๆ (Scan/Blink/Move/Texture/AI) ใน face label
+  - main_text บอกผู้ใช้ว่าต้องทำอะไรตามด่านปัจจุบัน
+  - ซ่อน Screen status เมื่อ SCREEN_DETECT_ENABLED = False
+
+สร้าง Windows Version — Win_Ver/:
+  - Win_Ver/main.py   : เปลี่ยน GPU setup เป็น os.add_dll_directory() (Windows)
+                         + sys.path setup เพื่อ import shared files จาก root
+  - Win_Ver/camera.py : เปลี่ยน CAP_V4L2 → CAP_DSHOW สำหรับ USB webcam Windows
+  - Win_Ver/config.py : ค่า default Windows (CAMERA_FLIP=True, DETECT_EVERY_N_FRAMES=2)
+                         sync ค่า Anti-Spoofing ให้ตรงกับ Linux แล้ว
+  - Win_Ver/profiles/ : cam_main.py, cam_usb.py, test.py (เหมือน Linux)
+  - Win_Ver/run.bat   : launcher script พร้อม error check + profile argument
+  - Win_Ver/install.bat: ติดตั้ง dependencies + interactive เลือก GPU/CPU
+
+================================================================================
+
+### ปัญหาที่เจอ
+
+- GPU Bug ใน Version 5: onnxruntime ไม่สามารถ load model บน GPU ได้ใน environment
+  บางอย่าง ทำให้ต้องแก้การ setup CUDA providers ใน Version 6
+
+- Screen Border Detection false positive: กล้อง IP fisheye ทำให้ขอบพื้นหลัง
+  ถูกตีความว่าเป็นขอบจอโทรศัพท์ตลอดเวลา แม้ปรับ margin และ threshold หลายรอบก็ไม่หาย
+  (พบในวันศุกร์ที่ 27 หลังทดสอบกับกล้องจริง)
+
+- UI ไม่แสดงด่าน Liveness ที่กำลัง block: ผู้ใช้ไม่รู้ว่าระบบรออะไร
+  เห็นแค่ "Scan X/Y" ทุกด่าน
+
+================================================================================
+
+### แนวทางการแก้ไขปัญหา
+
+- GPU Bug: แก้ CUDA EP setup ใน encode_faces_arcface.py และ liveness_engine.py
+  ให้ fallback ไป CPU ได้อัตโนมัติเมื่อ GPU ไม่พร้อม
+
+- Screen Border: ปิดด่านนี้ทั้งหมดและชดเชยด้วย Finger Challenge 2 ชุด
+  + MiniFASNet ที่เข้มขึ้น (threshold/frequency/required count)
+
+- UI Liveness: ปรับ get_face_visual() และ draw_face_guide() ให้ตรวจสอบ state
+  แต่ละด่านแบบ real-time และแสดงคำแนะนำที่ตรงกับด่านปัจจุบัน
+
+================================================================================
