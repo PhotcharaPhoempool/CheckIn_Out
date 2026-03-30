@@ -201,7 +201,7 @@ def _get_oval_blend(h, w, cx, cy, ew, eh):
 
 def draw_face_guide(frame, face_boxes_full: list, liveness_map: dict,
                     persons: dict = None, now_ts: float = 0.0):
-    if not cfg.GUIDE_OVERLAY:
+    if not cfg.GUIDE_OVERLAY or cfg.TEST_MODE:
         return
 
     h, w = frame.shape[:2]
@@ -340,6 +340,92 @@ def _draw_instruction_card(frame, main_text: str, sub_text: str, accent: tuple):
 
 # ─── HUD ─────────────────────────────────────
 
+def draw_screen_debug(frame, dbg: dict):
+    """
+    แสดงข้อมูล Screen Border Detection แบบ real-time สำหรับ calibration
+    เรียกเฉพาะตอน TEST_MODE=True — ไม่กระทบ production
+
+    สี:
+      เขียว  = เส้นแนวนอนที่อยู่ใน edge zone → นับเป็น edge_H
+      ฟ้า    = เส้นแนวตั้งที่อยู่ใน edge zone → นับเป็น edge_V
+      เทา    = เส้นอื่น (นอก zone หรือ diagonal) → ไม่นับ
+      กรอบส้ม = margin zone (ROI ที่สแกน)
+    """
+    if not dbg or not dbg.get("valid"):
+        return
+
+    roi_y1, roi_x1, roi_y2, roi_x2 = dbg["roi"]
+    top, right, bottom, left = dbg["face_box"]
+    ratio     = dbg["ratio"]
+    threshold = dbg["threshold"]
+    edge_h    = dbg["edge_h"]
+    edge_v    = dbg["edge_v"]
+    margin    = dbg["margin"]
+    n_lines   = dbg["n_lines"]
+    triggered = dbg["is_screen"]
+
+    inner_density = dbg.get("inner_density", 0.0)
+    inner_thresh  = dbg.get("inner_thresh", cfg.SCREEN_INNER_MAX)
+    is_border     = dbg.get("is_border", False)
+    is_inner      = dbg.get("is_inner", False)
+
+    # ─── วาดเส้นที่ตรวจเจอทั้งหมด ───
+    # เทา = edge zone แต่เฉียง (ไม่นับ)
+    for fx1, fy1, fx2, fy2 in dbg.get("lines_other", []):
+        cv2.line(frame, (fx1, fy1), (fx2, fy2), (100, 100, 100), 1, cv2.LINE_AA)
+    # เหลือง = เส้นใน center (นับ inner_density) ← สัญญาณหลักของรูป/วิดีโอ
+    for fx1, fy1, fx2, fy2 in dbg.get("lines_inner", []):
+        cv2.line(frame, (fx1, fy1), (fx2, fy2), (0, 230, 230), 2, cv2.LINE_AA)
+    # เขียว = แนวนอนใน edge zone (นับ edge_H)
+    for fx1, fy1, fx2, fy2 in dbg.get("lines_h", []):
+        cv2.line(frame, (fx1, fy1), (fx2, fy2), (0, 255, 80), 2, cv2.LINE_AA)
+    # ส้ม = แนวตั้งใน edge zone (นับ edge_V)
+    for fx1, fy1, fx2, fy2 in dbg.get("lines_v", []):
+        cv2.line(frame, (fx1, fy1), (fx2, fy2), (255, 140, 0), 2, cv2.LINE_AA)
+
+    # ─── กรอบ ROI (margin zone) ───
+    roi_color = (0, 0, 255) if triggered else (0, 165, 255)
+    cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), roi_color, 1)
+    cv2.rectangle(frame, (left, top), (right, bottom), roi_color, 1)
+
+    # ─── ป้าย debug ───
+    hud_color = (0, 0, 255) if triggered else (0, 220, 255)
+
+    def _flag(ok): return "FAIL" if ok else "ok"
+
+    fft_score  = dbg.get("fft_score", 1.0)
+    fft_thresh = dbg.get("fft_thresh", cfg.FFT_SCORE_MIN)
+    peak_rate  = dbg.get("fft_peak_rate", 0.0)
+    radial_cov = dbg.get("fft_radial_cov", 0.0)
+    is_fft     = dbg.get("is_fft", False)
+
+    texts = [
+        f"lines total={n_lines}  margin={margin}px",
+        f"[border] H(grn)={edge_h:.0f} V(org)={edge_v:.0f}  ratio={ratio:.4f}/{threshold:.4f} {_flag(is_border)}",
+        f"[inner]  cyan={len(dbg.get('lines_inner',[]))}  density={inner_density:.4f}/{inner_thresh:.4f} {_flag(is_inner)}",
+        f"[FFT]    score={fft_score:.3f}/{fft_thresh:.3f}  peak={peak_rate:.4f}  rcov={radial_cov:.3f} {_flag(is_fft)}",
+        ">>> SCREEN/PHOTO DETECTED! <<<" if triggered else "LIVE  (no screen detected)",
+    ]
+    x0 = max(roi_x1, 4)
+    y0 = roi_y2 + 14
+    fh_frame = frame.shape[0]
+    if y0 + len(texts) * 17 > fh_frame:
+        y0 = max(roi_y1 - len(texts) * 17 - 4, 14)
+    for i, txt in enumerate(texts):
+        if i == len(texts) - 1:   # บรรทัดสุดท้าย = verdict
+            col = (0, 0, 255) if triggered else (0, 220, 100)
+        elif i == 1:
+            col = (0, 0, 255) if is_border else (160, 160, 160)
+        elif i == 2:
+            col = (0, 0, 255) if is_inner else (0, 200, 200)
+        elif i == 3:
+            col = (0, 0, 255) if is_fft else (180, 180, 80)
+        else:
+            col = hud_color
+        cv2.putText(frame, txt, (x0, y0 + i * 17),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1, cv2.LINE_AA)
+
+
 def draw_hud(frame, fps, test_mode, checkout_done, remaining_sec=0):
     h = frame.shape[0]
     cv2.putText(frame, f"FPS:{fps:.0f}", (10, h-12),
@@ -356,7 +442,88 @@ def draw_hud(frame, fps, test_mode, checkout_done, remaining_sec=0):
 
 _panel_cache: dict = {"panel": None, "key": None, "tick": 0}
 
-def build_panel(persons: dict, liveness_map: dict, frame_height: int) -> np.ndarray:
+def draw_screen_debug_panel(panel: np.ndarray, dbg: dict):
+    """
+    วาดค่า Screen Detection ใน side panel (TEST_MODE)
+    dbg ควรเป็นค่าที่ smooth แล้วจาก main.py ไม่กระพริบ
+    """
+    if not dbg or not dbg.get("valid"):
+        return
+
+    W  = panel.shape[1]
+    ph = panel.shape[0]
+
+    # ─── header ───
+    sec_h  = 145
+    y_top  = ph - sec_h
+    cv2.rectangle(panel, (0, y_top), (W, y_top + 20), (50, 30, 30), cv2.FILLED)
+    cv2.putText(panel, "Screen Debug", (6, y_top + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 180, 180), 1)
+
+    def _row(label, val_str, y, flagged=False):
+        col_label = (130, 130, 130)
+        col_val   = (0, 80, 255) if flagged else (220, 220, 220)
+        cv2.putText(panel, label,   (6,      y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, col_label, 1)
+        cv2.putText(panel, val_str, (W - 95, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, col_val,   1)
+
+    y = y_top + 32
+    step = 18
+
+    ratio        = dbg.get("ratio", 0.0)
+    threshold    = dbg.get("threshold", 0.40)
+    inner_d      = dbg.get("inner_density", 0.0)
+    inner_t      = dbg.get("inner_thresh", 0.011)
+    fft_score    = dbg.get("fft_score", 1.0)
+    fft_t        = dbg.get("fft_thresh", 0.50)
+    peak_rate    = dbg.get("fft_peak_rate", 0.0)
+    radial_cov   = dbg.get("fft_radial_cov", 0.0)
+    is_border    = dbg.get("is_border", False)
+    is_inner     = dbg.get("is_inner", False)
+    is_fft       = dbg.get("is_fft", False)
+    triggered    = dbg.get("is_screen", False)
+
+    _row("border ratio",    f"{ratio:.4f} / {threshold:.3f}",    y, is_border);  y += step
+    _row("inner density",   f"{inner_d:.4f} / {inner_t:.4f}",    y, is_inner);   y += step
+    _row("FFT score",       f"{fft_score:.3f} / {fft_t:.2f}",    y, is_fft);     y += step
+    _row("peak_rate",       f"{peak_rate:.4f}",                   y);             y += step
+    _row("radial_cov",      f"{radial_cov:.3f}",                  y);             y += step
+
+    # timers
+    scr_t   = dbg.get("screen_timer", 0.0)
+    real_t  = dbg.get("real_timer",   0.0)
+    scr_max = dbg.get("screen_confirm", cfg.SCREEN_CONFIRM_SEC)
+    rel_max = dbg.get("real_reset",     cfg.SCREEN_RESET_SEC)
+    y += 4
+    cv2.line(panel, (4, y), (W - 4, y), (60, 60, 60), 1);  y += 6
+
+    # screen timer bar
+    cv2.putText(panel, f"screen {scr_t:.1f}/{scr_max:.0f}s", (6, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                (0, 80, 255) if scr_t > 0 else (80, 80, 80), 1)
+    bar_w = int((W - 8) * min(scr_t / max(scr_max, 0.1), 1.0))
+    cv2.rectangle(panel, (4, y + 3), (4 + bar_w, y + 9),
+                  (0, 60, 200) if scr_t > 0 else (40, 40, 40), cv2.FILLED)
+    y += 14
+
+    # real-face reset timer bar
+    cv2.putText(panel, f"real   {real_t:.1f}/{rel_max:.1f}s", (6, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                (0, 200, 80) if real_t > 0 else (80, 80, 80), 1)
+    bar_w = int((W - 8) * min(real_t / max(rel_max, 0.1), 1.0))
+    cv2.rectangle(panel, (4, y + 3), (4 + bar_w, y + 9),
+                  (0, 160, 50) if real_t > 0 else (40, 40, 40), cv2.FILLED)
+    y += 16
+
+    # verdict bar
+    bar_col = (0, 0, 200) if triggered else (0, 160, 60)
+    cv2.rectangle(panel, (4, y + 2), (W - 4, y + 18), bar_col, cv2.FILLED)
+    verdict = "SCREEN / PHOTO" if triggered else "LIVE  (no spoof)"
+    cv2.putText(panel, verdict, (8, y + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
+
+
+def build_panel(persons: dict, liveness_map: dict, frame_height: int,
+                screen_debug: dict = None) -> np.ndarray:
     # cache key: rebuild เมื่อ checked_in/out เปลี่ยน หรือ snapshot เปลี่ยน หรือทุก 15 frames
     _panel_cache["tick"] = (_panel_cache["tick"] + 1) % 15
     cache_key = (
@@ -366,8 +533,10 @@ def build_panel(persons: dict, liveness_map: dict, frame_height: int) -> np.ndar
               for n, p in persons.items()),
         frame_height,
     )
-    if _panel_cache["tick"] != 0 and _panel_cache["panel"] is not None and _panel_cache["key"] == cache_key:
-        return _panel_cache["panel"]
+    # TEST_MODE: ไม่ cache เพื่อให้ screen debug อัปเดตได้ทุก frame
+    if not cfg.TEST_MODE:
+        if _panel_cache["tick"] != 0 and _panel_cache["panel"] is not None and _panel_cache["key"] == cache_key:
+            return _panel_cache["panel"]
     _panel_cache["key"] = cache_key
 
     W = cfg.PANEL_WIDTH
@@ -433,6 +602,10 @@ def build_panel(persons: dict, liveness_map: dict, frame_height: int) -> np.ndar
 
         y += ITEM_H
         cv2.line(panel, (5, y-4), (W-5, y-4), C.DIVIDER, 1)
+
+    # TEST_MODE: วาด screen debug section ที่ท้าย panel
+    if cfg.TEST_MODE and screen_debug:
+        draw_screen_debug_panel(panel, screen_debug)
 
     _panel_cache["panel"] = panel
     return panel
