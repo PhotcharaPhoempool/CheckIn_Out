@@ -181,6 +181,12 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
     display_fps  = 0.0
     last_face_ts = start_ts
 
+    # ─── Screen Debug EMA (TEST_MODE) ───
+    # smoothing กันกระพริบ — ค่าตัวเลขใช้ EMA, ค่า bool ใช้ latest
+    _EMA_A = 0.20   # alpha: ต่ำ = smooth กว่า (ตอบสนองช้ากว่า)
+    _screen_ema: dict = {}   # EMA ของ float values
+    _screen_debug_display: dict = {}   # ส่งเข้า build_panel
+
     # ─── คำนวณ oval ───
     def _compute_oval(h, w):
         cx = w // 2
@@ -327,6 +333,44 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
 
             session.try_checkin(name, camera_name)
 
+            # ── Screen Debug (TEST_MODE) — เก็บค่าล่าสุด อัปเดต EMA ทีหลัง ──
+            if cfg.TEST_MODE and do_detect:
+                _raw_dbg = session.engine.screen.detect_debug(frame, face_box)
+                if _raw_dbg.get("valid"):
+                    _float_keys = ["ratio", "inner_density",
+                                   "fft_score", "fft_peak_rate", "fft_radial_cov"]
+                    for _k in _float_keys:
+                        _v = _raw_dbg.get(_k, 0.0)
+                        _screen_ema[_k] = (_EMA_A * _v
+                                           + (1 - _EMA_A) * _screen_ema.get(_k, _v))
+                    # ดึง timing จาก liveness state ของคนแรกที่เจอ
+                    _lv = next(iter(session.liveness.values()), None)
+                    _scr_dur  = (now_ts - _lv.screen_detect_start_ts
+                                 if _lv and _lv.screen_detect_start_ts > 0 else 0.0)
+                    _real_dur = (now_ts - _lv.screen_real_start_ts
+                                 if _lv and _lv.screen_real_start_ts > 0 else 0.0)
+
+                    _screen_debug_display = {
+                        "valid":          True,
+                        "ratio":          _screen_ema.get("ratio", 0.0),
+                        "threshold":      _raw_dbg.get("threshold", cfg.SCREEN_EDGE_MAX),
+                        "inner_density":  _screen_ema.get("inner_density", 0.0),
+                        "inner_thresh":   _raw_dbg.get("inner_thresh", cfg.SCREEN_INNER_MAX),
+                        "fft_score":      _screen_ema.get("fft_score", 1.0),
+                        "fft_thresh":     _raw_dbg.get("fft_thresh", cfg.FFT_SCORE_MIN),
+                        "fft_peak_rate":  _screen_ema.get("fft_peak_rate", 0.0),
+                        "fft_radial_cov": _screen_ema.get("fft_radial_cov", 0.0),
+                        "screen_timer":   _scr_dur,
+                        "real_timer":     _real_dur,
+                        "screen_confirm": cfg.SCREEN_CONFIRM_SEC,
+                        "real_reset":     cfg.SCREEN_RESET_SEC,
+                        # bool ใช้ค่าล่าสุดตรงๆ (ไม่ smooth)
+                        "is_border":  _raw_dbg.get("is_border", False),
+                        "is_inner":   _raw_dbg.get("is_inner", False),
+                        "is_fft":     _raw_dbg.get("is_fft", False),
+                        "is_screen":  _raw_dbg.get("is_screen", False),
+                    }
+
             # ── Draw ──
             if cfg.SHOW_LANDMARKS and lm_dict:
                 ui.draw_landmarks(frame, lm_dict, scale=1.0)
@@ -344,7 +388,8 @@ def run_camera(camera_index: int = 1, camera_name: str = "CAM_MAIN"):
         remaining = max(0, cfg.TEST_DURATION_SECONDS - int(now_ts - start_ts)) if cfg.TEST_MODE else 0
         ui.draw_hud(frame, display_fps, cfg.TEST_MODE, checkout_done, remaining)
 
-        panel = ui.build_panel(session.persons, session.liveness, frame.shape[0])
+        panel = ui.build_panel(session.persons, session.liveness, frame.shape[0],
+                               screen_debug=_screen_debug_display if cfg.TEST_MODE else None)
         cv2.imshow(win_name, np.hstack([frame, panel]))
 
         key = cv2.waitKey(1) & 0xFF

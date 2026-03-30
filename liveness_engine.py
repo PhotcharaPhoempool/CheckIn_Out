@@ -11,6 +11,8 @@ liveness_engine.py — ระบบตรวจสอบความจริง
 
 import math
 import random
+import threading
+import queue as _queue
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -51,6 +53,8 @@ class LivenessState:
 
     # ด่าน 4: Screen
     screen_ok: bool = True   # assume OK จนกว่าจะ detect ขอบจอ
+    screen_detect_start_ts: float = 0.0   # เริ่มนับเวลาที่ตรวจเจอ screen ต่อเนื่อง
+    screen_real_start_ts:   float = 0.0   # เริ่มนับเวลาที่เจอหน้าจริงระหว่างนับ screen
 
     # ด่าน 5: Challenge
     challenge_ok: bool = not cfg.CHALLENGE_ENABLED
@@ -286,7 +290,59 @@ class TextureAnalyzer:
 # ด่าน 4: Screen Border Detection
 # ─────────────────────────────────────────────
 class ScreenDetector:
-    """ตรวจขอบจอ/กรอบมือถือรอบใบหน้า ด้วย Canny + HoughLines"""
+    """ตรวจขอบจอ/กรอบมือถือรอบใบหน้า ด้วย Canny + HoughLines + FFT"""
+
+    @staticmethod
+    def _fft_score(face_gray: np.ndarray) -> tuple:
+        """
+        Fourier Transform anti-spoof — คืน (score, meta)
+        score  : 0..1  สูง = หน้าจริง, ต่ำ = จอ/รูป
+        meta   : {"peak_rate": float, "radial_cov": float}
+
+        peak_rate  — สัดส่วน HF pixel ที่ผิดปกติ > 4σ (จับ LCD grid หยาบ)
+        radial_cov — ความแปรปรวนของ radial power profile (จับ pixel pitch ละเอียด)
+        """
+        if face_gray is None or face_gray.shape[0] < 32 or face_gray.shape[1] < 32:
+            return 1.0, {"peak_rate": 0.0, "radial_cov": 0.0}
+
+        roi_f = cv2.resize(face_gray, (128, 128)).astype(np.float64) / 255.0
+        F     = np.fft.fftshift(np.fft.fft2(roi_f))
+        mag   = np.abs(F)
+
+        H, W   = roi_f.shape
+        cy, cx = H // 2, W // 2
+        Y, X   = np.ogrid[:H, :W]
+        R      = np.sqrt((Y - cy) ** 2 + (X - cx) ** 2)
+        r_max  = min(cy, cx)
+
+        # peak_rate — HF pixel ที่เกิน 4σ (จอมี periodic spike)
+        hf_mask   = (R > 0.30 * r_max) & (R < 0.90 * r_max)
+        hf_vals   = mag[hf_mask]
+        hf_mean   = hf_vals.mean()
+        hf_std    = hf_vals.std() + 1e-10
+        n_peaks   = int(np.sum(hf_vals > hf_mean + 4.0 * hf_std))
+        peak_rate = n_peaks / max(hf_vals.size, 1)
+
+        # radial_cov — CoV ของ radial power (จอมี spike ที่ freq เฉพาะ)
+        # vectorized: bin ทุก pixel พร้อมกัน แทน Python for-loop
+        n_rings    = 20
+        ring_edges = np.linspace(0.15 * r_max, 0.95 * r_max, n_rings + 1)
+        ring_idx   = np.searchsorted(ring_edges[1:], R.ravel())   # 0..n_rings-1 + overflow
+        valid      = ring_idx < n_rings
+        flat_mag   = mag.ravel()
+        ring_sum   = np.bincount(ring_idx[valid], weights=flat_mag[valid], minlength=n_rings)
+        ring_cnt   = np.bincount(ring_idx[valid], minlength=n_rings).clip(min=1)
+        ring_power = (ring_sum / ring_cnt) + 1e-10
+        radial_cov = float(ring_power.std() / ring_power.mean())
+
+        # ปรับ baseline สำหรับ IP camera RTSP H.264:
+        #   - peak_rate baseline สูงขึ้น (DCT block artifact) → ลด weight: 25→12
+        #   - radial_cov baseline สูงขึ้น (compression pattern) → เลื่อน offset: 0.7→1.5, weight: 2→1
+        # หน้าจริง (RTSP): peak_rate≈0.05, radial_cov≈1.7 → spoof_indicator≈0.75 → score≈0.25
+        # จอมือถือ:         peak_rate≈0.15, radial_cov≈2.8 → spoof_indicator≈3.1  → score=0.0
+        spoof_indicator = peak_rate * 12.0 + max(0.0, radial_cov - 1.5) * 1.0
+        score = float(max(0.0, 1.0 - spoof_indicator))
+        return score, {"peak_rate": float(peak_rate), "radial_cov": float(radial_cov)}
 
     def detect(self, bgr_frame: np.ndarray, face_box: tuple) -> tuple:
         """
@@ -322,29 +378,176 @@ class ScreenDetector:
             return False, 0.0
 
         # แบ่ง ROI เป็น "edge zone" (margin px) รอบนอก กับ "center" (พื้นที่หน้า)
-        # นับเฉพาะเส้นที่ midpoint อยู่ใน edge zone — phone border อยู่ที่นี่
+        # edge zone  → นับเส้นขอบ (phone border)
+        # center zone → นับ inner density (pixel pattern ของจอ/รูป)
         edge_h = 0.0   # เส้นแนวนอนในแถบขอบ
         edge_v = 0.0   # เส้นแนวตั้งในแถบขอบ
+        inner_len = 0.0  # รวม length ทุกเส้นในพื้นที่ center (face area)
         for line in lines:
             x1l, y1l, x2l, y2l = line[0]
             mx, my = (x1l + x2l) / 2, (y1l + y2l) / 2
             length = math.hypot(x2l - x1l, y2l - y1l)
             angle  = abs(math.atan2(y2l - y1l, x2l - x1l))
 
-            # เส้นอยู่ใน edge zone หรือไม่
-            in_h_zone = my < margin or my > rh - margin   # แถบบน/ล่าง
-            in_v_zone = mx < margin or mx > rw - margin   # แถบซ้าย/ขวา
+            in_h_zone = my < margin or my > rh - margin
+            in_v_zone = mx < margin or mx > rw - margin
+            in_center = not in_h_zone and not in_v_zone
 
             if angle < 0.18 or abs(angle - math.pi) < 0.18:   # แนวนอน
                 if in_h_zone:
                     edge_h += length
+                elif in_center:
+                    inner_len += length
             elif abs(angle - math.pi / 2) < 0.18:             # แนวตั้ง
                 if in_v_zone:
                     edge_v += length
+                elif in_center:
+                    inner_len += length
+            elif in_center:                                     # เส้นเฉียงใน center
+                inner_len += length
+
+        face_area = max(1, (bottom - top) * (right - left))
+        inner_density = inner_len / face_area
 
         perimeter = 2 * (rh + rw)
         ratio = min(edge_h, edge_v) / perimeter if perimeter > 0 else 0
-        return ratio > cfg.SCREEN_EDGE_MAX, ratio
+
+        is_border = ratio > cfg.SCREEN_EDGE_MAX
+        is_inner  = inner_density > cfg.SCREEN_INNER_MAX
+
+        # FFT check บน face crop โดยตรง
+        is_fft = False
+        if cfg.FFT_ENABLED:
+            top, right, bottom, left = face_box
+            face_crop_gray = cv2.cvtColor(
+                bgr_frame[max(0, top):min(fh, bottom), max(0, left):min(fw, right)],
+                cv2.COLOR_BGR2GRAY,
+            ) if (bottom > top and right > left) else None
+            fft_score, _ = self._fft_score(face_crop_gray)
+            is_fft = fft_score < cfg.FFT_SCORE_MIN
+
+        return (is_border or is_inner or is_fft), ratio
+
+    def detect_debug(self, bgr_frame: np.ndarray, face_box: tuple) -> dict:
+        """
+        Debug version — คืนค่า intermediate ทั้งหมดสำหรับ calibration (TEST_MODE)
+        Returns dict: valid, roi, margin, edge_h, edge_v, ratio, threshold, is_screen, n_lines
+        """
+        margin = cfg.SCREEN_MARGIN
+        top, right, bottom, left = face_box
+        fh, fw = bgr_frame.shape[:2]
+
+        roi_y1 = max(0, top - margin)
+        roi_y2 = min(fh, bottom + margin)
+        roi_x1 = max(0, left - margin)
+        roi_x2 = min(fw, right + margin)
+
+        roi_bgr = bgr_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+        if roi_bgr.size == 0:
+            return {"valid": False}
+        rh, rw = roi_bgr.shape[:2]
+        roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+        edges = cv2.Canny(roi_gray, 50, 150)
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180, threshold=30,
+            minLineLength=min(rh, rw) // 4,
+            maxLineGap=8,
+        )
+
+        edge_h = 0.0
+        edge_v = 0.0
+        inner_len = 0.0
+        n_lines = 0 if lines is None else len(lines)
+
+        # เส้นแบ่งเป็น 4 กลุ่ม (coordinate กลับเป็น frame space แล้ว)
+        lines_h     = []   # แนวนอน ใน edge zone → นับ edge_H (สีเขียว)
+        lines_v     = []   # แนวตั้ง ใน edge zone → นับ edge_V (สีส้ม)
+        lines_inner = []   # เส้นใน center zone → นับ inner_density (สีเหลือง)
+        lines_other = []   # edge zone แต่เฉียง → ไม่นับ (สีเทา)
+
+        if lines is not None:
+            for line in lines:
+                x1l, y1l, x2l, y2l = line[0]
+                mx, my = (x1l + x2l) / 2, (y1l + y2l) / 2
+                length = math.hypot(x2l - x1l, y2l - y1l)
+                angle  = abs(math.atan2(y2l - y1l, x2l - x1l))
+                in_h_zone = my < margin or my > rh - margin
+                in_v_zone = mx < margin or mx > rw - margin
+                in_center = not in_h_zone and not in_v_zone
+
+                fx1, fy1 = x1l + roi_x1, y1l + roi_y1
+                fx2, fy2 = x2l + roi_x1, y2l + roi_y1
+
+                if angle < 0.18 or abs(angle - math.pi) < 0.18:   # แนวนอน
+                    if in_h_zone:
+                        edge_h += length
+                        lines_h.append((fx1, fy1, fx2, fy2))
+                    elif in_center:
+                        inner_len += length
+                        lines_inner.append((fx1, fy1, fx2, fy2))
+                    else:
+                        lines_other.append((fx1, fy1, fx2, fy2))
+                elif abs(angle - math.pi / 2) < 0.18:             # แนวตั้ง
+                    if in_v_zone:
+                        edge_v += length
+                        lines_v.append((fx1, fy1, fx2, fy2))
+                    elif in_center:
+                        inner_len += length
+                        lines_inner.append((fx1, fy1, fx2, fy2))
+                    else:
+                        lines_other.append((fx1, fy1, fx2, fy2))
+                else:                                               # เฉียง
+                    if in_center:
+                        inner_len += length
+                        lines_inner.append((fx1, fy1, fx2, fy2))
+                    else:
+                        lines_other.append((fx1, fy1, fx2, fy2))
+
+        face_area = max(1, (bottom - top) * (right - left))
+        inner_density = inner_len / face_area
+        perimeter = 2 * (rh + rw)
+        ratio = min(edge_h, edge_v) / perimeter if perimeter > 0 else 0.0
+
+        # FFT บน face crop
+        fft_score, fft_meta = 1.0, {"peak_rate": 0.0, "radial_cov": 0.0}
+        if cfg.FFT_ENABLED and bottom > top and right > left:
+            face_gray = cv2.cvtColor(
+                bgr_frame[max(0, top):min(bgr_frame.shape[0], bottom),
+                           max(0, left):min(bgr_frame.shape[1], right)],
+                cv2.COLOR_BGR2GRAY,
+            )
+            fft_score, fft_meta = self._fft_score(face_gray)
+
+        is_border = ratio > cfg.SCREEN_EDGE_MAX
+        is_inner  = inner_density > cfg.SCREEN_INNER_MAX
+        is_fft    = cfg.FFT_ENABLED and fft_score < cfg.FFT_SCORE_MIN
+
+        return {
+            "valid":          True,
+            "face_box":       face_box,
+            "roi":            (roi_y1, roi_x1, roi_y2, roi_x2),
+            "margin":         margin,
+            "edge_h":         edge_h,
+            "edge_v":         edge_v,
+            "ratio":          ratio,
+            "inner_density":  inner_density,
+            "inner_thresh":   cfg.SCREEN_INNER_MAX,
+            "threshold":      cfg.SCREEN_EDGE_MAX,
+            "fft_score":      fft_score,
+            "fft_thresh":     cfg.FFT_SCORE_MIN,
+            "fft_peak_rate":  fft_meta["peak_rate"],
+            "fft_radial_cov": fft_meta["radial_cov"],
+            "is_border":      is_border,
+            "is_inner":       is_inner,
+            "is_fft":         is_fft,
+            "is_screen":      is_border or is_inner or is_fft,
+            "n_lines":        n_lines,
+            "lines_h":        lines_h,
+            "lines_v":        lines_v,
+            "lines_inner":    lines_inner,
+            "lines_other":    lines_other,
+        }
 
 
 # ─────────────────────────────────────────────
@@ -540,6 +743,36 @@ class LivenessEngine:
         self.finger   = FingerChallenge()
         self.fas      = FASDetector()
 
+        # FAS background thread — ไม่ block main loop
+        self._fas_task_q  = _queue.Queue(maxsize=2)   # รับงานจาก main
+        self._fas_result  = {}                         # {state_id: result}
+        self._fas_lock    = threading.Lock()
+        self._fas_thread  = threading.Thread(
+            target=self._fas_worker, daemon=True, name="FAS-Worker"
+        )
+        self._fas_thread.start()
+
+    def _fas_worker(self):
+        """รันใน background thread — ดึงงานจาก queue แล้ว check FAS"""
+        while True:
+            state_id, crop = self._fas_task_q.get()
+            result = self.fas.check(crop)
+            if result:
+                with self._fas_lock:
+                    self._fas_result[state_id] = result
+
+    def _fas_submit(self, s: "LivenessState", crop: np.ndarray):
+        """ส่ง face crop ไปให้ background thread — ถ้า queue เต็มให้ข้าม"""
+        try:
+            self._fas_task_q.put_nowait((id(s), crop))
+        except _queue.Full:
+            pass
+
+    def _fas_get(self, s: "LivenessState") -> dict:
+        """ดึงผลลัพธ์ที่ background thread คำนวณเสร็จแล้ว (หรือ None)"""
+        with self._fas_lock:
+            return self._fas_result.pop(id(s), None)
+
     def create_state(self, now_ts: float) -> LivenessState:
         return LivenessState(start_ts=now_ts)
 
@@ -608,37 +841,67 @@ class LivenessEngine:
                     s.texture_ok = True
                     print("[TEXTURE OK]")
 
-        # ─── ด่าน 4: Screen Border ───
+        # ─── ด่าน 4: Screen Border (time-based confirmation) ───
         if cfg.SCREEN_DETECT_ENABLED and s.screen_ok and do_detect:
             is_screen, ratio = self.screen.detect(frame, face_box)
-            if is_screen:
-                s.screen_ok = False
-                s.failed = True
-                s.fail_reason = f"Screen({ratio:.2f})"
-                print(f"[SCREEN DETECTED] ratio={ratio:.2f}")
-                return
 
-        # ─── ด่าน 6: MiniFASNet (DeepFace) ───
+            if is_screen:
+                # ตรวจเจอจอ — reset real-face timer, เริ่ม/ต่อ screen timer
+                s.screen_real_start_ts = 0.0
+                if s.screen_detect_start_ts == 0.0:
+                    s.screen_detect_start_ts = now_ts
+
+                screen_dur = now_ts - s.screen_detect_start_ts
+                if screen_dur >= cfg.SCREEN_CONFIRM_SEC:
+                    # ตรวจเจอ screen ต่อเนื่องครบเวลา → fail
+                    s.screen_ok = False
+                    s.failed = True
+                    s.fail_reason = f"Screen({ratio:.2f},{screen_dur:.1f}s)"
+                    print(f"[SCREEN CONFIRMED] ratio={ratio:.2f} dur={screen_dur:.1f}s")
+                    return
+                else:
+                    print(f"[SCREEN] {screen_dur:.1f}/{cfg.SCREEN_CONFIRM_SEC}s ratio={ratio:.2f}")
+
+            else:
+                # ตรวจเจอหน้าจริง
+                if s.screen_detect_start_ts > 0.0:
+                    # อยู่ระหว่างนับ screen — เริ่ม/ต่อ real-face timer
+                    if s.screen_real_start_ts == 0.0:
+                        s.screen_real_start_ts = now_ts
+                    real_dur = now_ts - s.screen_real_start_ts
+                    if real_dur >= cfg.SCREEN_RESET_SEC:
+                        # หน้าจริงยืนยันได้ → reset screen counter
+                        print(f"[SCREEN RESET] real face {real_dur:.1f}s → counter reset")
+                        s.screen_detect_start_ts = 0.0
+                        s.screen_real_start_ts   = 0.0
+                    # ยังไม่ครบ → คง screen timer ไว้ (อาจเป็น noise)
+                else:
+                    s.screen_real_start_ts = 0.0
+
+        # ─── ด่าน 6: MiniFASNet (DeepFace) — background thread ไม่ block loop ───
         if cfg.FAS_ENABLED and not s.fas_ok and not s.failed and do_detect:
-            # ถ้า DeepFace ไม่พร้อม → ข้ามด่านนี้ ไม่ block ระบบ
             if not self.fas.is_available:
                 s.fas_ok = True
             else:
+                # ส่งงานไป background thread (ไม่รอผล)
                 s.fas_check_count += 1
                 if s.fas_check_count % cfg.FAS_CHECK_EVERY == 0:
-                    result = self.fas.check(face_crop)
-                    if result:
-                        s.fas_score = result["score"]
-                        if result["is_real"]:
-                            s.fas_real_count += 1
-                            if s.fas_real_count >= cfg.FAS_REQUIRED_REAL:
-                                s.fas_ok = True
-                                print(f"[FAS OK] score={result['score']:.3f} ({s.fas_real_count} real)")
-                        else:
-                            s.failed = True
-                            s.fail_reason = f"FAS:Spoof({result['score']:.2f})"
-                            print(f"[FAS SPOOF] score={result['score']:.3f}")
-                            return
+                    self._fas_submit(s, face_crop)
+
+                # ตรวจว่า background thread คำนวณเสร็จหรือยัง
+                result = self._fas_get(s)
+                if result:
+                    s.fas_score = result["score"]
+                    if result["is_real"]:
+                        s.fas_real_count += 1
+                        if s.fas_real_count >= cfg.FAS_REQUIRED_REAL:
+                            s.fas_ok = True
+                            print(f"[FAS OK] score={result['score']:.3f} ({s.fas_real_count} real)")
+                    else:
+                        s.failed = True
+                        s.fail_reason = f"FAS:Spoof({result['score']:.2f})"
+                        print(f"[FAS SPOOF] score={result['score']:.3f}")
+                        return
 
         # ─── ด่าน 5: Finger Challenge ───
         if cfg.CHALLENGE_ENABLED and not s.challenge_ok and s.all_passive_passed() and not s.failed:

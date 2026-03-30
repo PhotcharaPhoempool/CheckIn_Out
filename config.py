@@ -17,8 +17,8 @@ PANEL_WIDTH           = 250
 # ╔═══════════════════════════════════════════╗
 # ║  โหมดทดสอบ                                 ║
 # ╚═══════════════════════════════════════════╝
-TEST_MODE             = False
-TEST_DURATION_SECONDS = 60
+TEST_MODE             = True
+TEST_DURATION_SECONDS = 360
 CHECKOUT_TIME         = dtime(22, 0)
 
 # ╔═══════════════════════════════════════════╗
@@ -79,11 +79,24 @@ TEXTURE_CHROMA_MIN    = 6.0
 # ╔═══════════════════════════════════════════╗
 # ║  Anti-Spoofing: ด่าน 4 — Screen Border    ║
 # ╚═══════════════════════════════════════════╝
-# ปิด Screen Border Detection — กล้อง wide-angle fisheye ทำให้ขอบประตู/ตู้ในพื้นหลัง
-# ดูชิดหน้าในภาพ ทำให้ false positive ตลอด ใช้ Finger Challenge + FAS แทน
-SCREEN_DETECT_ENABLED = False
+# ตรวจ 2 สัญญาณ:
+#   1) edge_ratio    — เส้นขอบใน margin zone รอบหน้า (phone bezel)
+#   2) inner_density — ความหนาแน่นเส้นในพื้นที่หน้า (pixel pattern ของจอ/รูป)
+#      รูปภาพ/วิดีโอบนจอมี regular edge pattern หนาแน่นกว่าหน้าจริงมาก
+# ─── ปรับ SCREEN_INNER_MAX โดยดูจาก debug HUD (TEST_MODE=True) ───
+SCREEN_DETECT_ENABLED = True
 SCREEN_MARGIN         = 35
-SCREEN_EDGE_MAX       = 0.40
+SCREEN_EDGE_MAX       = 0.40   # border ratio (เส้นขอบ margin zone)
+SCREEN_INNER_MAX      = 0.0110   # inner density — ปรับตามผลทดสอบ
+                                # หน้าจริง ~0.02-0.06 | รูป/จอ ~0.10-0.30+
+# Time-based confirmation — ลด false positive
+SCREEN_CONFIRM_SEC    = 5.0    # ตรวจเจอ screen ต่อเนื่องครบ N วิ → fail
+SCREEN_RESET_SEC      = 1.5    # ตรวจเจอหน้าจริงต่อเนื่องครบ N วิ → reset counter
+
+# FFT (analyze_fft จาก FFT.py) — ใช้คู่กับ Canny
+# score = 0..1,  สูง = หน้าจริง, ต่ำ = จอ/รูป  (ปรับ FFT_SCORE_MIN ด้วย debug HUD)
+FFT_ENABLED       = True
+FFT_SCORE_MIN     = 0.130  # score ต่ำกว่านี้ = spoof  หน้าจริง >0.200 | ปลอม <0.150
 
 # ╔═══════════════════════════════════════════╗
 # ║  Anti-Spoofing: ด่าน 5 — Finger Challenge ║
